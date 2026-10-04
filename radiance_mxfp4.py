@@ -23,6 +23,9 @@ import sys
 import torch
 
 ENABLED = os.environ.get("RADIANCE_MXFP4_W4A8", "0") == "1"
+# Weight-only MXFP4: bf16 activations, dequantized in the kernel's LDS staging pass and accumulated
+# by the native bf16-WMMA GEMM. Opt-in and independent of RADIANCE_MXFP4_W4A8.
+ENABLED16 = os.environ.get("RADIANCE_MXFP4_W4A16", "0") == "1"
 MIN_M = int(os.environ.get("RADIANCE_MXFP4_W4A8_MIN_M", "256"))
 # Decode band for the small-M kernel. 0 = dark. Also gates the scratch preallocation.
 DECODE_MAX_M = int(os.environ.get("RADIANCE_MXFP4_DECODE_MAX_M", "0"))
@@ -137,6 +140,22 @@ def unpermute_w(packed: "torch.Tensor", N: int, K: int) -> "torch.Tensor":
                   .permute(0, 3, 1, 2, 4)      # [n-tile][row][k-step][half][4 bytes]
                   .contiguous()
                   .view(N, K // 2))
+
+
+def permute_w16(packed: "torch.Tensor", N: int, K: int) -> "torch.Tensor":
+    """[N, K/2] uint8 -> bf16-WMMA fragment order, same [N, K/2] shape.
+
+    permute_w is the fp8 fragment layout (a lane owns 8 contiguous K elements), but the bf16 WMMA
+    fragment is two 4-element runs 8 apart, so its slot packs byte pairs {2h,2h+1} of each half of
+    the 16-element k-step. Python side of radiance_w16_gemm's WPERM staging; a byte permutation,
+    not a re-quantisation.
+    """
+    nt, ks = N // 16, K // 16
+    p = packed.view(nt, 16, ks, 2, 2, 2)       # [n-tile][row][k-step][half][pair][2 bytes]
+    out = torch.empty(nt, ks, 2, 16, 4, dtype=torch.uint8, device=packed.device)
+    out[:, :, :, :, 0:2] = p[:, :, :, 0, :, :].permute(0, 2, 3, 1, 4)
+    out[:, :, :, :, 2:4] = p[:, :, :, 1, :, :].permute(0, 2, 3, 1, 4)
+    return out.contiguous().view(N, K // 2)
 
 
 def split_fp6(packed: "torch.Tensor", N: int, K: int, rows: int = 0):
@@ -689,6 +708,49 @@ def _(x, weight, weight_scale, weight_ref):
     return torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=torch.bfloat16)
 
 
+# Split-K partial buffer for the W4A16 decode tile: [4 splits][16 rows][max N] fp32, allocated at
+# weight-load time (a hipMalloc inside CUDA-graph capture is illegal, see the W4A8 decode scratch).
+_A16_SCRATCH = [None, 0]      # [tensor, max N covered]
+
+
+def _a16_ensure_scratch(device, n: int) -> None:
+    need = max(int(n), 32768)
+    if _A16_SCRATCH[0] is None or _A16_SCRATCH[1] < need:
+        _A16_SCRATCH[0] = torch.empty(4 * 16 * need, dtype=torch.float32, device=device)
+        _A16_SCRATCH[1] = need
+        sys.stderr.write(f"[radiance.mxfp4] W4A16 split-K scratch {_A16_SCRATCH[0].numel() * 4 >> 20} "
+                         f"MiB (N<={need})\n")
+
+
+@torch.library.custom_op("radiance::mxfp4_linear_w4a16", mutates_args=())
+def mxfp4_linear_w4a16(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+                       wperm: int) -> torch.Tensor:
+    """W4A16: bf16 activations x MXFP4 weights dequantized in the kernel staging pass."""
+    if _ext is None or not hasattr(_ext, "launch_w4a16"):
+        raise RuntimeError("radiance.mxfp4: the W4A16 kernel is not in radiance_mxfp4_fp8.so")
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    if not weight_scale.is_contiguous():
+        weight_scale = weight_scale.contiguous()
+    M, K = x.shape
+    N = weight.shape[0]
+    if _A16_SCRATCH[0] is None:
+        raise RuntimeError("radiance.mxfp4: W4A16 split-K scratch was never allocated; "
+                           "process_weights_after_loading must run before the first forward")
+    out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+    _ext.launch_w4a16(x.data_ptr(), weight.data_ptr(), weight_scale.data_ptr(), out.data_ptr(),
+                      _A16_SCRATCH[0].data_ptr(), M, N, K, int(wperm),
+                      torch.cuda.current_stream().cuda_stream)
+    return out
+
+
+@mxfp4_linear_w4a16.register_fake
+def _(x, weight, weight_scale, wperm):
+    return torch.empty((x.shape[0], weight.shape[0]), device=x.device, dtype=torch.bfloat16)
+
+
 def _tp_world_size() -> int:
     """Tensor-parallel world size, 1 when vLLM's groups are not initialised (benches)."""
     try:
@@ -938,15 +1000,119 @@ def _make_kernel_class():
     return RadianceMxfp4W4A8LinearKernel
 
 
+def _make_a16_kernel_class():
+    """Weight-only MXFP4 plugin. Built lazily, same reason as _make_kernel_class."""
+    from vllm.model_executor.kernels.linear.mxfp4.base import (
+        MxFp4LinearKernel,
+        MxFp4LinearLayerConfig,
+    )
+
+    class RadianceMxfp4W4A16LinearKernel(MxFp4LinearKernel):
+        """MXFP4 weights x bf16 activations on gfx1201, via the native bf16-WMMA GEMM."""
+
+        @classmethod
+        def is_supported(cls, compute_capability=None):
+            if not ENABLED16:
+                return False, "RADIANCE_MXFP4_W4A16 is not enabled"
+            if _ext is None or not hasattr(_ext, "launch_w4a16"):
+                return False, "the W4A16 kernel is missing from radiance_mxfp4_fp8"
+            if not _on_gfx12x():
+                return False, "the radiance W4A16 MXFP4 kernel is compiled for gfx12x only"
+            return True, None
+
+        @classmethod
+        def can_implement(cls, config: MxFp4LinearLayerConfig):
+            if config.activation_quant_key is not None:
+                return False, "only supports weight-only MXFP4 (no activation quantization)"
+            return True, None
+
+        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            N = int(layer.weight.shape[0])
+            K = int(layer.weight.shape[1]) * 2
+            if K % 64:
+                raise RuntimeError(f"[radiance.mxfp4] W4A16 needs K % 64 == 0, got K={K}")
+            if N % 16:
+                raise RuntimeError(f"[radiance.mxfp4] W4A16 needs N % 16 == 0, got N={N}")
+            if (layer.weight_scale.dim() != 2 or int(layer.weight_scale.shape[0]) != N
+                    or int(layer.weight_scale.shape[1]) != K // 32):
+                raise RuntimeError(f"[radiance.mxfp4] W4A16 scale shape "
+                                   f"{tuple(layer.weight_scale.shape)} is not [N={N}, K/32={K // 32}]")
+            # The kernel wants [K/32, N] (coalesced across n); the loader leaves [N, K/32].
+            layer.weight_scale = torch.nn.Parameter(
+                layer.weight_scale.data.T.contiguous(), requires_grad=False)
+            if WPERM:
+                layer.weight = torch.nn.Parameter(
+                    permute_w16(layer.weight.data, N, K), requires_grad=False)
+            _a16_ensure_scratch(layer.weight.device, N)
+            layer.radiance_w4a16_ok = True
+            sys.stderr.write(f"[radiance.mxfp4] W4A16 layer N={N} K={K} "
+                             f"layout={'fragment' if WPERM else 'checkpoint'}\n")
+
+        def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
+                          bias: torch.Tensor | None = None) -> torch.Tensor:
+            y = torch.ops.radiance.mxfp4_linear_w4a16(
+                x, layer.weight, layer.weight_scale, int(WPERM))
+            if bias is not None:
+                y = y + bias
+            return y
+
+    return RadianceMxfp4W4A16LinearKernel
+
+
+def _make_both_kernel_class(a16_cls, w4a8_cls):
+    """One list entry for a serve that sets both flags: route per layer by activation key. The
+    deployed patch_quark_mxfp4.py inserts exactly one class, so both flags must resolve here."""
+    from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearKernel
+
+    class RadianceMxfp4LinearKernel(MxFp4LinearKernel):
+        @classmethod
+        def is_supported(cls, compute_capability=None):
+            if (a16_cls.is_supported(compute_capability)[0]
+                    or w4a8_cls.is_supported(compute_capability)[0]):
+                return True, None
+            return False, "neither RADIANCE_MXFP4_W4A8 nor RADIANCE_MXFP4_W4A16 is enabled"
+
+        @classmethod
+        def can_implement(cls, config):
+            if config.activation_quant_key is None:
+                return a16_cls.can_implement(config)
+            return w4a8_cls.can_implement(config)
+
+        def __init__(self, config):
+            MxFp4LinearKernel.__init__(self, config)
+            if config.activation_quant_key is None:
+                self._inner = a16_cls(config)
+            else:
+                self._inner = w4a8_cls(config)
+
+        def process_weights_after_loading(self, layer):
+            self._inner.process_weights_after_loading(layer)
+
+        def apply_weights(self, layer, x, bias=None):
+            return self._inner.apply_weights(layer, x, bias)
+
+    return RadianceMxfp4LinearKernel
+
+
 _KERNEL_CLS = None
 
 
 def kernel_class():
-    """The plugin class, built once. Returns None if anything about it is unavailable."""
+    """The plugin class the MXFP4 selector inserts, built once. Returns None when neither flag is
+    set or anything about the kernel is unavailable -- with both flags off, model loading is
+    byte-for-byte the stock path."""
     global _KERNEL_CLS
     if _KERNEL_CLS is None:
         try:
-            _KERNEL_CLS = _make_kernel_class()
+            if not ENABLED and not ENABLED16:
+                _KERNEL_CLS = False
+            elif ENABLED and ENABLED16:
+                _KERNEL_CLS = _make_both_kernel_class(
+                    _make_a16_kernel_class(), _make_kernel_class())
+            elif ENABLED16:
+                _KERNEL_CLS = _make_a16_kernel_class()
+            else:
+                _KERNEL_CLS = _make_kernel_class()
         except Exception as e:
             sys.stderr.write(f"[radiance.mxfp4] kernel class unavailable, disabled: {e!r}\n")
             _KERNEL_CLS = False

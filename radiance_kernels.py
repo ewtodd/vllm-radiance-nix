@@ -72,6 +72,10 @@ def install_load_hook():
     def _wrapped(self, layer):
         _orig(self, layer)
         try:
+            # A layer running the native W8A16 kernel reads the checkpoint fp8 weight directly;
+            # a shuffle here would corrupt it.
+            if getattr(layer, "_radiance_w8a16", False):
+                return
             # A layer radiance_w4 has already packed to 4 bits has no fp8 weight left to shuffle.
             if getattr(layer, "_radiance_w4", None) is not None:
                 return
@@ -403,6 +407,33 @@ def install_r4d_report():
     Worker.compile_or_warm_up_model = compile_or_warm_up_model
 
 
+def install_w8a16_hook():
+    """Register the native ROCm W8A16 kernel at the head of vLLM's FP8 kernel lists when
+    RADIANCE_FP8_W8A16=1. Runs after vllm is imported and before any model load, which is when
+    Fp8LinearMethod/CompressedTensorsW8A16Fp8 resolve init_fp8_linear_kernel."""
+    if os.environ.get("RADIANCE_FP8_W8A16", "0") != "1":
+        return
+    import radiance_fp8
+
+    kernel = radiance_fp8.kernel_class()
+    if kernel is None:
+        sys.stderr.write("[radiance.fp8] W8A16 requested but the kernel is unavailable\n")
+        return
+    import vllm.model_executor.kernels.linear as linear_kernels
+    from vllm.platforms import PlatformEnum
+
+    registered = []
+    for name in ("_POSSIBLE_FP8_BLOCK_KERNELS", "_POSSIBLE_WFP8A16_KERNELS"):
+        mapping = getattr(linear_kernels, name)
+        entries = mapping.setdefault(PlatformEnum.ROCM, [])
+        if kernel not in entries:
+            entries.insert(0, kernel)
+            registered.append(name)
+    sys.stderr.write(f"[radiance.fp8] W8A16 kernel at the head of {', '.join(registered)} "
+                     f"(ROCm)\n")
+    sys.stderr.flush()
+
+
 def install_all():
     """Install every gated radiance runtime hook. Called once per process by the vLLM plugin loader,
     after torch/vllm/aiter are imported but before the model loads. Idempotent; each hook is env-gated."""
@@ -417,6 +448,10 @@ def install_all():
         install_load_hook()
     except Exception as e:
         sys.stderr.write(f"[radiance] install_load_hook failed: {e!r}\n")
+    try:
+        install_w8a16_hook()
+    except Exception as e:
+        sys.stderr.write(f"[radiance] install_w8a16_hook failed: {e!r}\n")
     try:
         install_attn_config_hook()
     except Exception as e:

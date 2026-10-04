@@ -1821,6 +1821,350 @@ static void launch6_at_p(uintptr_t a, uintptr_t w, uintptr_t wh, uintptr_t ws, u
   launch_at_impl(a, w, ws, wref, as, c, M, N, K, pb1, pb2, astride, stream, wh);
 }
 
+// ============================================================================================
+// Weight-only GEMMs: W4A16 (MXFP4 weights) and W8A16 (e4m3 block weights) with bf16 activations.
+//
+// Both kernels dequantize the weight tile to bf16 while staging it into LDS, then accumulate
+// through the gfx1201 bf16 WMMA. The staged bf16 values are exactly what a bf16 reference model
+// holds -- an E2M1 code times an E8M0 power of two is exact in bf16, an e4m3 code widens to bf16
+// losslessly and the block scale is the same f32 multiply the reference dequant does -- so the
+// only difference from the reference is the order of the fp32 accumulation.
+//
+// The activation is never quantized: A is read as the model's own bf16. Two tile geometries share
+// one kernel body: a TTM=1/BM=16 decode tile whose M waste matches the fp8 WMMA minimum, and a
+// TTM=2/BM=128 prefill tile. The launcher picks by M; there is no Python-side fallback.
+//
+// W4A16 checkpoint order:  W [N, K/2] uint8 nibble-packed, Ws [K/32, N] e8m0.
+// W4A16 WPERM:             W in bf16-fragment slot order (see permute_w16 in Python).
+// W8A16:                   W [N, K] e4m3, Ws [N/128, K/128] fp32.
+// ============================================================================================
+typedef __bf16 v8bf __attribute__((ext_vector_type(8)));
+typedef float v8f __attribute__((ext_vector_type(8)));
+typedef float v2f __attribute__((ext_vector_type(2)));
+
+// The 16 E2M1 codes as bf16 bit patterns. Codes 8..15 are 0..7 with the sign bit set.
+__device__ __constant__ unsigned short kE2M1H[16] = {
+    0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0,
+    0x8000, 0xBF00, 0xBF80, 0xBFC0, 0xC000, 0xC040, 0xC080, 0xC0C0};
+
+__device__ __forceinline__ float bf16h_to_f(unsigned short h) {
+  return __builtin_bit_cast(float, (unsigned int)h << 16);
+}
+__device__ __forceinline__ unsigned short f_to_bf16h(float f) {
+  return __builtin_bit_cast(unsigned short, __float2bfloat16(f));
+}
+// Two f32 -> one packed bf16 dword in 3 VALU; the two scalar converts above lower to ~10.
+// Round-half-away rather than RTNE, and no NaN canonicalisation: both are fine for finite
+// dequantized weight values, but not for a general-purpose conversion.
+__device__ __forceinline__ unsigned int f2bf2_pack(float a, float b) {
+  const unsigned int ua = __builtin_bit_cast(unsigned int, a) + 0x8000u;
+  const unsigned int ub = __builtin_bit_cast(unsigned int, b) + 0x8000u;
+  return __builtin_amdgcn_perm(ub, ua, 0x07060302u);
+}
+// E8M0 is 2^(e-127): exactly the f32 whose exponent field is e (e=0 becomes 0.0).
+__device__ __forceinline__ float e8m0_to_f(unsigned int e) {
+  return __int_as_float((int)e << 23);
+}
+// One 16x16 bf16 A/B fragment: lane l owns rows/cols (base + l%16), k = kbase + 4*(l/16) + 0..3
+// and kbase + 8 + 4*(l/16) + 0..3 (probed layout, same as libr4d's bf16 fragment helpers).
+__device__ __forceinline__ v8bf lds_bf16_frag(const unsigned short *rowbase) {
+  const uint2 *pw = (const uint2 *)rowbase;
+  union { uint2 w[2]; v8bf f; } u;
+  u.w[0] = pw[0];
+  u.w[1] = pw[2];
+  return u.f;
+}
+__device__ __forceinline__ v8f wmma_bf16(v8bf a, v8bf b, v8f c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+}
+
+#define BW_BK 64
+#define BW_PAD 8
+#define BW_ASTR (BW_BK + BW_PAD)
+#define BW_WSTR (BW_BK + BW_PAD)
+
+// WT: 0 = MXFP4 (packed nibbles, e8m0 scale per 32 K), 1 = e4m3 (f32 scale per 128x128 block).
+template <int TWM, int TWN, int TTM, int TTN, int WT, bool WPERM>
+__global__ __launch_bounds__((TWM * TWN) * 32) void radiance_w16_gemm(
+    const __bf16 *__restrict__ A, const unsigned char *__restrict__ W,
+    const unsigned char *__restrict__ Ws, __bf16 *__restrict__ C,
+    float *__restrict__ P, int M, int N, int K) {
+  constexpr int NTH = TWM * TWN * 32;
+  constexpr int BW_BM = TWM * TTM * 16;      // block M extent
+  constexpr int BW_BN = TWN * TTN * 16;    // block N extent
+  __shared__ unsigned short sA[BW_BM * BW_ASTR];
+  __shared__ unsigned short sW[BW_BN * BW_WSTR];
+
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int wm = wave / TWN, wn = wave % TWN;
+  const int col = lane & 15, kmid = (lane >> 4) * 4;
+  const int m0 = blockIdx.y * BW_BM, n0 = blockIdx.x * BW_BN;
+
+  v8f acc[TTM][TTN];
+#pragma unroll
+  for (int i = 0; i < TTM; ++i)
+#pragma unroll
+    for (int j = 0; j < TTN; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
+
+  // Split-K: gridDim.z slices of K, each block's partials in P (decode geometry only; the
+  // prefill launcher always passes gridDim.z == 1, where kb=0 and kc=K is the original loop).
+  const int ks = gridDim.z;
+  const int kc = K / ks;
+  const int kb = blockIdx.z * kc;
+  for (int k0 = kb; k0 < kb + kc; k0 += BW_BK) {
+    const __bf16 *__restrict__ Ab = A + (size_t)m0 * K + k0;
+    // A tile: BW_BM*BK bf16, 16 bytes per thread per iteration. Clamp, never predicate (the fp8
+    // kernels' note: a predicated staging load forces s_wait_loadcnt 0 after every load).
+    for (int idx = tid * 16; idx < BW_BM * BW_BK * 2; idx += NTH * 16) {
+      const int r = idx / (BW_BK * 2), c = idx % (BW_BK * 2);
+      const int rc = r < M - 1 - m0 ? r : M - 1 - m0;
+      *(uint4_t *)(&sA[r * BW_ASTR + c / 2]) =
+          *(const uint4_t *)(Ab + (size_t)rc * K + c / 2);
+    }
+
+    if constexpr (WT == 0) {
+      if constexpr (!WPERM) {
+        // Checkpoint order: 8 packed bytes per thread -> 16 bf16, one 32-K scale block each.
+        const unsigned char *__restrict__ Wb = W + ((size_t)n0 * K + k0) / 2;
+        const unsigned char *__restrict__ Wsb = Ws + (size_t)(k0 / 32) * N + n0;
+        for (int idx = tid * 8; idx < BW_BN * (BW_BK / 2); idx += NTH * 8) {
+          const int r = idx / (BW_BK / 2), c = idx % (BW_BK / 2);
+          const int rc = r < N - 1 - n0 ? r : N - 1 - n0;
+          const unsigned long long packed =
+              *(const unsigned long long *)(Wb + (size_t)rc * (K / 2) + c);
+          const float s = e8m0_to_f(Wsb[(size_t)(c / 16) * N + rc]);   // c/16 = 0 or 1
+          unsigned int outw[8];
+#pragma unroll
+          for (int t = 0; t < 8; ++t) {
+            const unsigned char byte = (unsigned char)(packed >> (8 * t));
+            outw[t] = f2bf2_pack(bf16h_to_f(kE2M1H[byte & 15]) * s,
+                                 bf16h_to_f(kE2M1H[byte >> 4]) * s);
+          }
+          // Bytes 0..7 are elements c*2 .. c*2+15 -- two uint4 stores.
+          *(uint4_t *)(&sW[r * BW_WSTR + c * 2]) =
+              uint4_t{outw[0], outw[1], outw[2], outw[3]};
+          *(uint4_t *)(&sW[r * BW_WSTR + c * 2 + 8]) =
+              uint4_t{outw[4], outw[5], outw[6], outw[7]};
+        }
+      } else {
+        // bf16 fragment order: one lane uint32 slot per (n-tile, k-step); the slot holds the
+        // lane's two 4-element k runs, so a wave reads 128 contiguous bytes.
+        constexpr int KSTEPS_T = BW_BK / 16, NTILES_T = BW_BN / 16;
+        constexpr int TOT_SLOTS = NTILES_T * KSTEPS_T * 32;
+        constexpr int WSLOTS = (TOT_SLOTS >= NTH * 4) ? 4 : 2;
+        const unsigned int *__restrict__ Wp = (const unsigned int *)W;
+        const int ksteps_g = K / 16, kstep0 = k0 / 16;
+        for (int off = 0; off < TOT_SLOTS; off += NTH * WSLOTS) {
+          const int sl = off + tid * WSLOTS;
+          const int lane_ = sl & 31, rest = sl >> 5;
+          const int kst = rest % KSTEPS_T, ntl = rest / KSTEPS_T;
+          const int r = ntl * 16 + (lane_ & 15);
+          const int half = lane_ >> 4;
+          const int gc = n0 + r < N - WSLOTS ? n0 + r : N - WSLOTS;
+          const int lanec = (half << 4) | (gc & 15);
+          const unsigned int *src =
+              &Wp[((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 + lanec];
+          unsigned int wq[WSLOTS];
+          if constexpr (WSLOTS == 4) {
+            const uint4_t v = *(const uint4_t *)src;
+            wq[0] = v[0]; wq[1] = v[1]; wq[2] = v[2]; wq[3] = v[3];
+          } else {
+            const uint2_t v = *(const uint2_t *)src;
+            wq[0] = v[0]; wq[1] = v[1];
+          }
+          const int blk = (k0 + kst * 16) / 32;
+          unsigned int wsw;
+          if constexpr (WSLOTS == 4)
+            wsw = *(const unsigned int *)(Ws + (size_t)blk * N + gc);
+          else
+            wsw = *(const unsigned short *)(Ws + (size_t)blk * N + gc);
+#pragma unroll
+          for (int q = 0; q < WSLOTS; ++q) {
+            const float s = e8m0_to_f((wsw >> (8 * q)) & 0xFFu);
+            // bytes 0,1 -> k = kst*16 + 4*half; bytes 2,3 -> +8
+            unsigned int e0w[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+              const unsigned char byte = (unsigned char)(wq[q] >> (8 * t));
+              e0w[t] = f2bf2_pack(bf16h_to_f(kE2M1H[byte & 15]) * s,
+                                  bf16h_to_f(kE2M1H[byte >> 4]) * s);
+            }
+            const uint2_t dw = uint2_t{e0w[0], e0w[1]};
+            const uint2_t up = uint2_t{e0w[2], e0w[3]};
+            *(uint2_t *)(&sW[(r + q) * BW_WSTR + kst * 16 + 4 * half]) = dw;
+            *(uint2_t *)(&sW[(r + q) * BW_WSTR + kst * 16 + 8 + 4 * half]) = up;
+          }
+        }
+      }
+    } else {
+      // e4m3 weights, f32 128x128 block scales. Each thread converts 16 bytes; its 16 elements
+      // lie inside one K block because BK=64 and the slab never crosses a 128 boundary.
+      const unsigned char *__restrict__ Wb = W + (size_t)n0 * K + k0;
+      const float *__restrict__ Wsf = (const float *)Ws;
+      const int Kb = K / 128;
+      for (int idx = tid * 16; idx < BW_BN * BW_BK; idx += NTH * 16) {
+        const int r = idx / BW_BK, c = idx % BW_BK;
+        const int rc = r < N - 1 - n0 ? r : N - 1 - n0;
+        const float s = Wsf[(size_t)((n0 + rc) >> 7) * Kb + (k0 >> 7)];
+        const uint4_t v = *(const uint4_t *)(Wb + (size_t)rc * K + c);
+        unsigned int outw[8];
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+          const v2f p0 = __builtin_amdgcn_cvt_pk_f32_fp8((int)v[d], false);
+          const v2f p1 = __builtin_amdgcn_cvt_pk_f32_fp8((int)v[d], true);
+          outw[2 * d] = f2bf2_pack(p0[0] * s, p0[1] * s);
+          outw[2 * d + 1] = f2bf2_pack(p1[0] * s, p1[1] * s);
+        }
+        *(uint4_t *)(&sW[r * BW_WSTR + c]) =
+            uint4_t{outw[0], outw[1], outw[2], outw[3]};
+        *(uint4_t *)(&sW[r * BW_WSTR + c + 8]) =
+            uint4_t{outw[4], outw[5], outw[6], outw[7]};
+      }
+    }
+    radiance_lds_barrier();
+
+#pragma unroll
+    for (int step = 0; step < BW_BK / 16; ++step) {
+      const int kk = step * 16 + kmid;
+      v8bf af[TTM], wf[TTN];
+#pragma unroll
+      for (int i = 0; i < TTM; ++i)
+        af[i] = lds_bf16_frag(&sA[(wm * TTM * 16 + i * 16 + col) * BW_ASTR + kk]);
+#pragma unroll
+      for (int j = 0; j < TTN; ++j)
+        wf[j] = lds_bf16_frag(&sW[(wn * TTN * 16 + j * 16 + col) * BW_WSTR + kk]);
+      __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+      for (int i = 0; i < TTM; ++i)
+#pragma unroll
+        for (int j = 0; j < TTN; ++j)
+          acc[i][j] = wmma_bf16(af[i], wf[j], acc[i][j]);
+    }
+    radiance_lds_barrier();
+  }
+
+  if (ks == 1) {
+    unsigned short *__restrict__ Cu = (unsigned short *)C;
+#pragma unroll
+    for (int i = 0; i < TTM; ++i)
+#pragma unroll
+      for (int j = 0; j < TTN; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int m = m0 + wm * TTM * 16 + i * 16 + (lane >> 4) * 8 + e;
+          const int n = n0 + wn * TTN * 16 + j * 16 + col;
+          if (m < M && n < N) Cu[(size_t)m * N + n] = f_to_bf16h(acc[i][j][e]);
+        }
+  } else {
+    float *__restrict__ Pb = P + (size_t)blockIdx.z * (16 * N);
+#pragma unroll
+    for (int i = 0; i < TTM; ++i)
+#pragma unroll
+      for (int j = 0; j < TTN; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int m = m0 + wm * TTM * 16 + i * 16 + (lane >> 4) * 8 + e;
+          const int n = n0 + wn * TTN * 16 + j * 16 + col;
+          if (m < M && n < N) Pb[(size_t)m * N + n] = acc[i][j][e];
+        }
+  }
+}
+
+// Sums the split-K partials into C. One row of N per blockIdx.y, 256 columns per block.
+__global__ __launch_bounds__(256) void radiance_w16_reduce(const float *__restrict__ P,
+                                                           __bf16 *__restrict__ C,
+                                                           int M, int N, int ks) {
+  const int n = blockIdx.x * 256 + threadIdx.x;
+  const int m = blockIdx.y;
+  if (n >= N || m >= M) return;
+  float sum = 0.f;
+  for (int z = 0; z < ks; ++z) sum += P[(size_t)z * (16 * N) + (size_t)m * N + n];
+  ((unsigned short *)C)[(size_t)m * N + n] = f_to_bf16h(sum);
+}
+
+// Split-K width for the decode tile: the narrow shapes (down/out, 40 N-blocks) leave the part
+// underfilled at M<=16 and a K slice is the only free axis. K must stay divisible by KS*BW_BK.
+static int w16_ksplit(int nblk, int M, int K) {
+  const int fill = (M <= 16) ? 96 : 64;
+  for (int ks = 1; ks <= 4; ks <<= 1) {
+    if (nblk * ks >= fill && K % (BW_BK * ks) == 0) return ks;
+  }
+  for (int ks = 4; ks >= 1; ks >>= 1) {
+    if (K % (BW_BK * ks) == 0) return ks;
+  }
+  return 1;
+}
+
+static void launch_w4a16(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t c, uintptr_t p,
+                         int M, int N, int K, int wperm, uintptr_t stream) {
+  if (M <= 0) throw std::runtime_error("radiance_w4a16: M must be positive");
+  if (K % BW_BK) throw std::runtime_error("radiance_w4a16: K must be a multiple of 64");
+  if (N % 16) throw std::runtime_error("radiance_w4a16: N must be a multiple of 16");
+  const __bf16 *A = (const __bf16 *)a;
+  const unsigned char *W = (const unsigned char *)w;
+  const unsigned char *Ws = (const unsigned char *)ws;
+  __bf16 *C = (__bf16 *)c;
+  float *P = (float *)p;
+  const hipStream_t st = (hipStream_t)stream;
+  if (M <= 16) {
+    const int nblk = (N + 127) / 128;
+    const int ks = w16_ksplit(nblk, M, K);
+    if (ks > 1 && P == nullptr)
+      throw std::runtime_error("radiance_w4a16: split-K needs the partial scratch buffer");
+    dim3 grid(nblk, (M + 15) / 16, ks);
+    if (wperm)
+      hipLaunchKernelGGL((radiance_w16_gemm<1, 8, 1, 1, 0, true>), grid, dim3(256), 0, st,
+                         A, W, Ws, C, P, M, N, K);
+    else
+      hipLaunchKernelGGL((radiance_w16_gemm<1, 8, 1, 1, 0, false>), grid, dim3(256), 0, st,
+                         A, W, Ws, C, P, M, N, K);
+    if (ks > 1) {
+      dim3 rgrid((N + 255) / 256, M);
+      hipLaunchKernelGGL(radiance_w16_reduce, rgrid, dim3(256), 0, st, P, C, M, N, ks);
+    }
+  } else {
+    dim3 grid((N + 63) / 64, (M + 127) / 128);
+    if (wperm)
+      hipLaunchKernelGGL((radiance_w16_gemm<4, 2, 2, 2, 0, true>), grid, dim3(256), 0, st,
+                         A, W, Ws, C, P, M, N, K);
+    else
+      hipLaunchKernelGGL((radiance_w16_gemm<4, 2, 2, 2, 0, false>), grid, dim3(256), 0, st,
+                         A, W, Ws, C, P, M, N, K);
+  }
+}
+
+static void launch_w8a16(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t c, uintptr_t p,
+                         int M, int N, int K, uintptr_t stream) {
+  if (M <= 0) throw std::runtime_error("radiance_w8a16: M must be positive");
+  if (K % 128) throw std::runtime_error("radiance_w8a16: K must be a multiple of 128");
+  if (N % 16) throw std::runtime_error("radiance_w8a16: N must be a multiple of 16");
+  const __bf16 *A = (const __bf16 *)a;
+  const unsigned char *W = (const unsigned char *)w;
+  const unsigned char *Ws = (const unsigned char *)ws;
+  __bf16 *C = (__bf16 *)c;
+  float *P = (float *)p;
+  const hipStream_t st = (hipStream_t)stream;
+  if (M <= 16) {
+    const int nblk = (N + 127) / 128;
+    const int ks = w16_ksplit(nblk, M, K);
+    if (ks > 1 && P == nullptr)
+      throw std::runtime_error("radiance_w8a16: split-K needs the partial scratch buffer");
+    dim3 grid(nblk, (M + 15) / 16, ks);
+    hipLaunchKernelGGL((radiance_w16_gemm<1, 8, 1, 1, 1, false>), grid, dim3(256), 0, st,
+                       A, W, Ws, C, P, M, N, K);
+    if (ks > 1) {
+      dim3 rgrid((N + 255) / 256, M);
+      hipLaunchKernelGGL(radiance_w16_reduce, rgrid, dim3(256), 0, st, P, C, M, N, ks);
+    }
+  } else {
+    dim3 grid((N + 63) / 64, (M + 127) / 128);
+    hipLaunchKernelGGL((radiance_w16_gemm<4, 2, 2, 2, 1, false>), grid, dim3(256), 0, st,
+                       A, W, Ws, C, P, M, N, K);
+  }
+}
+
 PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
   m.def("launch_at", &launch_at, "MXFP4 x FP8 WMMA GEMM on a fragment-tiled activation");
   m.def("launch", &launch, "MXFP4 x FP8 WMMA GEMM (gfx1201)");
@@ -1828,6 +2172,12 @@ PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
   m.def("launch_at_p", &launch_at_p, "fragment-tiled A variant of launch_p");
   m.def("launch6_p", &launch6_p, "MXFP6 (E2M3) x FP8 GEMM: launch_p plus the 2-bit plane wh after w (WPERM=1, wref)");
   m.def("launch6_at_p", &launch6_at_p, "fragment-tiled A variant of launch6_p");
+  m.def("launch_w4a16", &launch_w4a16,
+        "MXFP4 weight-only GEMM: bf16 activations x dequantized E2M1 weights (wperm selects the "
+        "bf16 fragment-order weight layout)");
+  m.def("launch_w8a16", &launch_w8a16,
+        "FP8 weight-only GEMM: bf16 activations x dequantized e4m3 weights with 128x128 block "
+        "scales");
   m.def("launch_silu_mul_quant", &launch_silu_mul_quant,
         "fused silu(gate)*up + per-token e4m3 quant, one WG per row",
         py::arg("gu"), py::arg("q"), py::arg("scale"), py::arg("M"), py::arg("N"),

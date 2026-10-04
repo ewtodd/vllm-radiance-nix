@@ -1,0 +1,32 @@
+{
+  "model": "w4a16",
+  "bench": "gsm8k",
+  "protocol": "chat",
+  "level": "medium",
+  "seed": 1234,
+  "items": 200,
+  "fewshot_seed": 1234,
+  "strict_match": 0.985,
+  "flexible_extract": 0.985,
+  "strict_match_ci95": 0.016846311168917667,
+  "flexible_extract_ci95": 0.016846311168917667,
+  "truncated": 0,
+  "parse_fail": 3,
+  "mean_completion_tokens": 300.33,
+  "max_completion_tokens": 2088,
+  "mean_reasoning_tokens": null,
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "max_tokens": 12288,
+    "chat_template_kwargs": {
+      "reasoning_effort": "medium"
+    }
+  },
+  "serving": {
+    "weights": "MXFP4 RTN (W4A16, dequant-to-bf16)",
+    "activations": "bf16",
+    "kv_cache": "fp16"
+  }
+}

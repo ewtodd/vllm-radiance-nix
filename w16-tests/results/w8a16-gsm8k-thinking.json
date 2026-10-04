@@ -1,0 +1,25 @@
+{
+  "model": "w8a16",
+  "bench": "gsm8k",
+  "protocol": "raw",
+  "mode": "thinking",
+  "items": 300,
+  "fewshot_seed": 1234,
+  "strict_match": 0.8666666666666667,
+  "flexible_extract": 0.86,
+  "strict_match_ci95": 0.038467225106672394,
+  "flexible_extract_ci95": 0.03926527897944103,
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "max_tokens": 3072
+  },
+  "serving": {
+    "weights": "FP8 e4m3 (W8A16, dequant-to-bf16)",
+    "activations": "bf16",
+    "kv_cache": "fp16"
+  }
+}
