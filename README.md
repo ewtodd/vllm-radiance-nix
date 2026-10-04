@@ -62,6 +62,30 @@ PyTorch (ROCm), Triton, AITER 0.1.17, vLLM 0.29.0 on transformers 5.14.1, the pi
 including the native **W4A16 / W8A16** weight-only GEMMs and the DFlash2 draft-rope patch. Tested on
 2 x Radeon AI PRO R9700 (gfx1201), TP=2.
 
+### Binary cache
+
+The house cache -- `nix-serve-ng` on e-desktop, behind Caddy at
+`https://cache.ethanwtodd.com` -- carries the heavy closures of this flake (ROCm SDK, PyTorch,
+AITER, vLLM), so a build substitutes them instead of compiling for hours. Add it in
+`configuration.nix`:
+
+```nix
+nix.settings = {
+  substituters = [ "https://cache.ethanwtodd.com" ];
+  trusted-public-keys = [ "e-desktop:35K0AY3HcDOSHVQ/lklmbvmrXjIspM/LYf7yek5lyVA=" ];
+};
+```
+
+or for a single command (as a trusted user):
+
+```bash
+nix build --substituters https://cache.ethanwtodd.com \
+  --trusted-public-keys 'e-desktop:35K0AY3HcDOSHVQ/lklmbvmrXjIspM/LYf7yek5lyVA='
+```
+
+Cache entries are keyed on the exact source rev and nixpkgs, so a checkout that diverges from the
+pinned inputs rebuilds only the paths that changed.
+
 ## Contents
 
 - [Status](#status)
