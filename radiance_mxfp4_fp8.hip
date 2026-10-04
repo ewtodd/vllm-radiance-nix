@@ -1884,7 +1884,140 @@ __device__ __forceinline__ v8f wmma_bf16(v8bf a, v8bf b, v8f c) {
 #define BW_WSTR (BW_BK + BW_PAD)
 
 // WT: 0 = MXFP4 (packed nibbles, e8m0 scale per 32 K), 1 = e4m3 (f32 scale per 128x128 block).
-template <int TWM, int TWN, int TTM, int TTN, int WT, bool WPERM>
+// Stages one BW_BK slab of A and dequantized W into LDS. Pulled out of the WMMA kernel so the
+// double-buffered pipeline can stage the next slab while the WMMA loop runs on the current one.
+template <int TWM, int TWN, int TTM, int TTN, int WT, bool WPERM, bool DQ>
+__device__ __forceinline__ void w16_stage(
+    unsigned short *sA, unsigned short *sW, const __bf16 *__restrict__ A,
+    const unsigned char *__restrict__ W, const unsigned char *__restrict__ Ws,
+    int m0, int n0, int k0, int M, int N, int K, int tid) {
+  constexpr int NTH = TWM * TWN * 32;
+  constexpr int BW_BM = TWM * TTM * 16;
+  constexpr int BW_BN = TWN * TTN * 16;
+  const __bf16 *__restrict__ Ab = A + (size_t)m0 * K + k0;
+  // A tile: BW_BM*BK bf16, 16 bytes per thread per iteration. Clamp, never predicate (the fp8
+  // kernels' note: a predicated staging load forces s_wait_loadcnt 0 after every load).
+  for (int idx = tid * 16; idx < BW_BM * BW_BK * 2; idx += NTH * 16) {
+    const int r = idx / (BW_BK * 2), c = idx % (BW_BK * 2);
+    const int rc = r < M - 1 - m0 ? r : M - 1 - m0;
+    *(uint4_t *)(&sA[r * BW_ASTR + c / 2]) =
+        *(const uint4_t *)(Ab + (size_t)rc * K + c / 2);
+  }
+
+  if constexpr (!DQ) {
+    // Roofline reference: W is bf16 [N,K] in plain row-major order; the dequantized tile is
+    // staged exactly like A, so the WMMA loop below is byte-for-byte the production one.
+    const __bf16 *__restrict__ Wb = ((const __bf16 *)W) + (size_t)n0 * K + k0;
+    for (int idx = tid * 16; idx < BW_BN * BW_BK * 2; idx += NTH * 16) {
+      const int r = idx / (BW_BK * 2), c = idx % (BW_BK * 2);
+      const int rc = r < N - 1 - n0 ? r : N - 1 - n0;
+      *(uint4_t *)(&sW[r * BW_WSTR + c / 2]) =
+          *(const uint4_t *)(Wb + (size_t)rc * K + c / 2);
+    }
+  } else if constexpr (WT == 0) {
+    if constexpr (!WPERM) {
+      // Checkpoint order: 8 packed bytes per thread -> 16 bf16, one 32-K scale block each.
+      const unsigned char *__restrict__ Wb = W + ((size_t)n0 * K + k0) / 2;
+      const unsigned char *__restrict__ Wsb = Ws + (size_t)(k0 / 32) * N + n0;
+      for (int idx = tid * 8; idx < BW_BN * (BW_BK / 2); idx += NTH * 8) {
+        const int r = idx / (BW_BK / 2), c = idx % (BW_BK / 2);
+        const int rc = r < N - 1 - n0 ? r : N - 1 - n0;
+        const unsigned long long packed =
+            *(const unsigned long long *)(Wb + (size_t)rc * (K / 2) + c);
+        const float s = e8m0_to_f(Wsb[(size_t)(c / 16) * N + rc]);   // c/16 = 0 or 1
+        unsigned int outw[8];
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+          const unsigned char byte = (unsigned char)(packed >> (8 * t));
+          outw[t] = f2bf2_pack(bf16h_to_f(kE2M1H[byte & 15]) * s,
+                               bf16h_to_f(kE2M1H[byte >> 4]) * s);
+        }
+        // Bytes 0..7 are elements c*2 .. c*2+15 -- two uint4 stores.
+        *(uint4_t *)(&sW[r * BW_WSTR + c * 2]) =
+            uint4_t{outw[0], outw[1], outw[2], outw[3]};
+        *(uint4_t *)(&sW[r * BW_WSTR + c * 2 + 8]) =
+            uint4_t{outw[4], outw[5], outw[6], outw[7]};
+      }
+    } else {
+      // bf16 fragment order: one lane uint32 slot per (n-tile, k-step); the slot holds the
+      // lane's two 4-element k runs, so a wave reads 128 contiguous bytes.
+      constexpr int KSTEPS_T = BW_BK / 16, NTILES_T = BW_BN / 16;
+      constexpr int TOT_SLOTS = NTILES_T * KSTEPS_T * 32;
+      constexpr int WSLOTS = (TOT_SLOTS >= NTH * 4) ? 4 : 2;
+      const unsigned int *__restrict__ Wp = (const unsigned int *)W;
+      const int ksteps_g = K / 16, kstep0 = k0 / 16;
+      for (int off = 0; off < TOT_SLOTS; off += NTH * WSLOTS) {
+        const int sl = off + tid * WSLOTS;
+        const int lane_ = sl & 31, rest = sl >> 5;
+        const int kst = rest % KSTEPS_T, ntl = rest / KSTEPS_T;
+        const int r = ntl * 16 + (lane_ & 15);
+        const int half = lane_ >> 4;
+        const int gc = n0 + r < N - WSLOTS ? n0 + r : N - WSLOTS;
+        const int lanec = (half << 4) | (gc & 15);
+        const unsigned int *src =
+            &Wp[((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 + lanec];
+        unsigned int wq[WSLOTS];
+        if constexpr (WSLOTS == 4) {
+          const uint4_t v = *(const uint4_t *)src;
+          wq[0] = v[0]; wq[1] = v[1]; wq[2] = v[2]; wq[3] = v[3];
+        } else {
+          const uint2_t v = *(const uint2_t *)src;
+          wq[0] = v[0]; wq[1] = v[1];
+        }
+        const int blk = (k0 + kst * 16) / 32;
+        unsigned int wsw;
+        if constexpr (WSLOTS == 4)
+          wsw = *(const unsigned int *)(Ws + (size_t)blk * N + gc);
+        else
+          wsw = *(const unsigned short *)(Ws + (size_t)blk * N + gc);
+#pragma unroll
+        for (int q = 0; q < WSLOTS; ++q) {
+          const float s = e8m0_to_f((wsw >> (8 * q)) & 0xFFu);
+          // bytes 0,1 -> k = kst*16 + 4*half; bytes 2,3 -> +8
+          unsigned int e0w[4];
+#pragma unroll
+          for (int t = 0; t < 4; ++t) {
+            const unsigned char byte = (unsigned char)(wq[q] >> (8 * t));
+            e0w[t] = f2bf2_pack(bf16h_to_f(kE2M1H[byte & 15]) * s,
+                                bf16h_to_f(kE2M1H[byte >> 4]) * s);
+          }
+          const uint2_t dw = uint2_t{e0w[0], e0w[1]};
+          const uint2_t up = uint2_t{e0w[2], e0w[3]};
+          *(uint2_t *)(&sW[(r + q) * BW_WSTR + kst * 16 + 4 * half]) = dw;
+          *(uint2_t *)(&sW[(r + q) * BW_WSTR + kst * 16 + 8 + 4 * half]) = up;
+        }
+      }
+    }
+  } else {
+    // e4m3 weights, f32 128x128 block scales. Each thread converts 16 bytes; its 16 elements
+    // lie inside one K block because BK=64 and the slab never crosses a 128 boundary.
+    const unsigned char *__restrict__ Wb = W + (size_t)n0 * K + k0;
+    const float *__restrict__ Wsf = (const float *)Ws;
+    const int Kb = K / 128;
+    for (int idx = tid * 16; idx < BW_BN * BW_BK; idx += NTH * 16) {
+      const int r = idx / BW_BK, c = idx % BW_BK;
+      const int rc = r < N - 1 - n0 ? r : N - 1 - n0;
+      const float s = Wsf[(size_t)((n0 + rc) >> 7) * Kb + (k0 >> 7)];
+      const uint4_t v = *(const uint4_t *)(Wb + (size_t)rc * K + c);
+      unsigned int outw[8];
+#pragma unroll
+      for (int d = 0; d < 4; ++d) {
+        const v2f p0 = __builtin_amdgcn_cvt_pk_f32_fp8((int)v[d], false);
+        const v2f p1 = __builtin_amdgcn_cvt_pk_f32_fp8((int)v[d], true);
+        outw[2 * d] = f2bf2_pack(p0[0] * s, p0[1] * s);
+        outw[2 * d + 1] = f2bf2_pack(p1[0] * s, p1[1] * s);
+      }
+      *(uint4_t *)(&sW[r * BW_WSTR + c]) =
+          uint4_t{outw[0], outw[1], outw[2], outw[3]};
+      *(uint4_t *)(&sW[r * BW_WSTR + c + 8]) =
+          uint4_t{outw[4], outw[5], outw[6], outw[7]};
+    }
+  }
+}
+
+// DQ=false is the benchmark-only roofline reference: W is an already-dequantized [N,K] bf16 matrix
+// staged straight into sW, so the identical WMMA loop runs with the dequantization removed.
+template <int TWM, int TWN, int TTM, int TTN, int WT, bool WPERM, bool DQ = true>
 __global__ __launch_bounds__((TWM * TWN) * 32) void radiance_w16_gemm(
     const __bf16 *__restrict__ A, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, __bf16 *__restrict__ C,
@@ -1914,115 +2047,7 @@ __global__ __launch_bounds__((TWM * TWN) * 32) void radiance_w16_gemm(
   const int kc = K / ks;
   const int kb = blockIdx.z * kc;
   for (int k0 = kb; k0 < kb + kc; k0 += BW_BK) {
-    const __bf16 *__restrict__ Ab = A + (size_t)m0 * K + k0;
-    // A tile: BW_BM*BK bf16, 16 bytes per thread per iteration. Clamp, never predicate (the fp8
-    // kernels' note: a predicated staging load forces s_wait_loadcnt 0 after every load).
-    for (int idx = tid * 16; idx < BW_BM * BW_BK * 2; idx += NTH * 16) {
-      const int r = idx / (BW_BK * 2), c = idx % (BW_BK * 2);
-      const int rc = r < M - 1 - m0 ? r : M - 1 - m0;
-      *(uint4_t *)(&sA[r * BW_ASTR + c / 2]) =
-          *(const uint4_t *)(Ab + (size_t)rc * K + c / 2);
-    }
-
-    if constexpr (WT == 0) {
-      if constexpr (!WPERM) {
-        // Checkpoint order: 8 packed bytes per thread -> 16 bf16, one 32-K scale block each.
-        const unsigned char *__restrict__ Wb = W + ((size_t)n0 * K + k0) / 2;
-        const unsigned char *__restrict__ Wsb = Ws + (size_t)(k0 / 32) * N + n0;
-        for (int idx = tid * 8; idx < BW_BN * (BW_BK / 2); idx += NTH * 8) {
-          const int r = idx / (BW_BK / 2), c = idx % (BW_BK / 2);
-          const int rc = r < N - 1 - n0 ? r : N - 1 - n0;
-          const unsigned long long packed =
-              *(const unsigned long long *)(Wb + (size_t)rc * (K / 2) + c);
-          const float s = e8m0_to_f(Wsb[(size_t)(c / 16) * N + rc]);   // c/16 = 0 or 1
-          unsigned int outw[8];
-#pragma unroll
-          for (int t = 0; t < 8; ++t) {
-            const unsigned char byte = (unsigned char)(packed >> (8 * t));
-            outw[t] = f2bf2_pack(bf16h_to_f(kE2M1H[byte & 15]) * s,
-                                 bf16h_to_f(kE2M1H[byte >> 4]) * s);
-          }
-          // Bytes 0..7 are elements c*2 .. c*2+15 -- two uint4 stores.
-          *(uint4_t *)(&sW[r * BW_WSTR + c * 2]) =
-              uint4_t{outw[0], outw[1], outw[2], outw[3]};
-          *(uint4_t *)(&sW[r * BW_WSTR + c * 2 + 8]) =
-              uint4_t{outw[4], outw[5], outw[6], outw[7]};
-        }
-      } else {
-        // bf16 fragment order: one lane uint32 slot per (n-tile, k-step); the slot holds the
-        // lane's two 4-element k runs, so a wave reads 128 contiguous bytes.
-        constexpr int KSTEPS_T = BW_BK / 16, NTILES_T = BW_BN / 16;
-        constexpr int TOT_SLOTS = NTILES_T * KSTEPS_T * 32;
-        constexpr int WSLOTS = (TOT_SLOTS >= NTH * 4) ? 4 : 2;
-        const unsigned int *__restrict__ Wp = (const unsigned int *)W;
-        const int ksteps_g = K / 16, kstep0 = k0 / 16;
-        for (int off = 0; off < TOT_SLOTS; off += NTH * WSLOTS) {
-          const int sl = off + tid * WSLOTS;
-          const int lane_ = sl & 31, rest = sl >> 5;
-          const int kst = rest % KSTEPS_T, ntl = rest / KSTEPS_T;
-          const int r = ntl * 16 + (lane_ & 15);
-          const int half = lane_ >> 4;
-          const int gc = n0 + r < N - WSLOTS ? n0 + r : N - WSLOTS;
-          const int lanec = (half << 4) | (gc & 15);
-          const unsigned int *src =
-              &Wp[((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 + lanec];
-          unsigned int wq[WSLOTS];
-          if constexpr (WSLOTS == 4) {
-            const uint4_t v = *(const uint4_t *)src;
-            wq[0] = v[0]; wq[1] = v[1]; wq[2] = v[2]; wq[3] = v[3];
-          } else {
-            const uint2_t v = *(const uint2_t *)src;
-            wq[0] = v[0]; wq[1] = v[1];
-          }
-          const int blk = (k0 + kst * 16) / 32;
-          unsigned int wsw;
-          if constexpr (WSLOTS == 4)
-            wsw = *(const unsigned int *)(Ws + (size_t)blk * N + gc);
-          else
-            wsw = *(const unsigned short *)(Ws + (size_t)blk * N + gc);
-#pragma unroll
-          for (int q = 0; q < WSLOTS; ++q) {
-            const float s = e8m0_to_f((wsw >> (8 * q)) & 0xFFu);
-            // bytes 0,1 -> k = kst*16 + 4*half; bytes 2,3 -> +8
-            unsigned int e0w[4];
-#pragma unroll
-            for (int t = 0; t < 4; ++t) {
-              const unsigned char byte = (unsigned char)(wq[q] >> (8 * t));
-              e0w[t] = f2bf2_pack(bf16h_to_f(kE2M1H[byte & 15]) * s,
-                                  bf16h_to_f(kE2M1H[byte >> 4]) * s);
-            }
-            const uint2_t dw = uint2_t{e0w[0], e0w[1]};
-            const uint2_t up = uint2_t{e0w[2], e0w[3]};
-            *(uint2_t *)(&sW[(r + q) * BW_WSTR + kst * 16 + 4 * half]) = dw;
-            *(uint2_t *)(&sW[(r + q) * BW_WSTR + kst * 16 + 8 + 4 * half]) = up;
-          }
-        }
-      }
-    } else {
-      // e4m3 weights, f32 128x128 block scales. Each thread converts 16 bytes; its 16 elements
-      // lie inside one K block because BK=64 and the slab never crosses a 128 boundary.
-      const unsigned char *__restrict__ Wb = W + (size_t)n0 * K + k0;
-      const float *__restrict__ Wsf = (const float *)Ws;
-      const int Kb = K / 128;
-      for (int idx = tid * 16; idx < BW_BN * BW_BK; idx += NTH * 16) {
-        const int r = idx / BW_BK, c = idx % BW_BK;
-        const int rc = r < N - 1 - n0 ? r : N - 1 - n0;
-        const float s = Wsf[(size_t)((n0 + rc) >> 7) * Kb + (k0 >> 7)];
-        const uint4_t v = *(const uint4_t *)(Wb + (size_t)rc * K + c);
-        unsigned int outw[8];
-#pragma unroll
-        for (int d = 0; d < 4; ++d) {
-          const v2f p0 = __builtin_amdgcn_cvt_pk_f32_fp8((int)v[d], false);
-          const v2f p1 = __builtin_amdgcn_cvt_pk_f32_fp8((int)v[d], true);
-          outw[2 * d] = f2bf2_pack(p0[0] * s, p0[1] * s);
-          outw[2 * d + 1] = f2bf2_pack(p1[0] * s, p1[1] * s);
-        }
-        *(uint4_t *)(&sW[r * BW_WSTR + c]) =
-            uint4_t{outw[0], outw[1], outw[2], outw[3]};
-        *(uint4_t *)(&sW[r * BW_WSTR + c + 8]) =
-            uint4_t{outw[4], outw[5], outw[6], outw[7]};
-      }
-    }
+    w16_stage<TWM, TWN, TTM, TTN, WT, WPERM, DQ>(sA, sW, A, W, Ws, m0, n0, k0, M, N, K, tid);
     radiance_lds_barrier();
 
 #pragma unroll
@@ -2097,6 +2122,27 @@ static int w16_ksplit(int nblk, int M, int K) {
   return 1;
 }
 
+// Prefill-tile override, used only by w16-tests/bench_kernel.py to A/B geometries. Production never
+// calls set_w16_prefill_tile, so the default (320x128) tile stays live. 0 restores the old 128x64
+// tile and 3 selects 256x128; anything else uses the default.
+static int g_w16_prefill_tile = -1;
+static void set_w16_prefill_tile(int tile) { g_w16_prefill_tile = tile; }
+
+template <int TWM, int TWN, int TTM, int TTN>
+static void w16_prefill(const __bf16 *A, const unsigned char *W, const unsigned char *Ws,
+                        __bf16 *C, float *P, int M, int N, int K, bool wperm, hipStream_t st) {
+  constexpr int NTH = TWM * TWN * 32;
+  constexpr int BW_BM = TWM * TTM * 16;
+  constexpr int BW_BN = TWN * TTN * 16;
+  dim3 grid((N + BW_BN - 1) / BW_BN, (M + BW_BM - 1) / BW_BM);
+  if (wperm)
+    hipLaunchKernelGGL((radiance_w16_gemm<TWM, TWN, TTM, TTN, 0, true>), grid, dim3(NTH), 0, st,
+                       A, W, Ws, C, P, M, N, K);
+  else
+    hipLaunchKernelGGL((radiance_w16_gemm<TWM, TWN, TTM, TTN, 0, false>), grid, dim3(NTH), 0, st,
+                       A, W, Ws, C, P, M, N, K);
+}
+
 static void launch_w4a16(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t c, uintptr_t p,
                          int M, int N, int K, int wperm, uintptr_t stream) {
   if (M <= 0) throw std::runtime_error("radiance_w4a16: M must be positive");
@@ -2124,14 +2170,15 @@ static void launch_w4a16(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t c, ui
       dim3 rgrid((N + 255) / 256, M);
       hipLaunchKernelGGL(radiance_w16_reduce, rgrid, dim3(256), 0, st, P, C, M, N, ks);
     }
+  } else if (g_w16_prefill_tile == 0) {
+    w16_prefill<4, 2, 2, 2>(A, W, Ws, C, P, M, N, K, wperm, st);   // old 128x64, 8 waves, 2x2
+  } else if (g_w16_prefill_tile == 3) {
+    w16_prefill<4, 4, 4, 2>(A, W, Ws, C, P, M, N, K, wperm, st);   // 256x128, 16 waves, 4x2
   } else {
-    dim3 grid((N + 63) / 64, (M + 127) / 128);
-    if (wperm)
-      hipLaunchKernelGGL((radiance_w16_gemm<4, 2, 2, 2, 0, true>), grid, dim3(256), 0, st,
-                         A, W, Ws, C, P, M, N, K);
-    else
-      hipLaunchKernelGGL((radiance_w16_gemm<4, 2, 2, 2, 0, false>), grid, dim3(256), 0, st,
-                         A, W, Ws, C, P, M, N, K);
+    // The shipped W4A16 prefill tile: 320 M x 128 N (4x4 waves of 5x2 fragments). It amortizes the
+    // per-slab barrier and the sA/sW staging over 50 WMMA per wave and measured 1.31x the old
+    // 128x64 tile's TFLOP/s at M=8192 (82 vs 62 on the 17408x5120 shape).
+    w16_prefill<4, 4, 5, 2>(A, W, Ws, C, P, M, N, K, wperm, st);
   }
 }
 
@@ -2165,6 +2212,49 @@ static void launch_w8a16(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t c, ui
   }
 }
 
+// Benchmark-only reference: the production WMMA body with the weight dequantization removed (W is
+// already bf16 [N,K]). `tile` picks the prefill geometry so the roofline can be measured per tile:
+//   0 = 128x64 (4x2 waves, 2x2 frags), 1 = 256x64 (4x2, 4x2), 2 = 128x128 (4x4, 2x2),
+//   3 = 256x128 (4x4, 4x2), 4 = 128x256 (2x8, 4x2), 5 = 128x256 (4x4, 2x4).
+static void launch_w16_bf16ref(uintptr_t a, uintptr_t w, uintptr_t c, int M, int N, int K, int tile,
+                               uintptr_t stream) {
+  const __bf16 *A = (const __bf16 *)a;
+  const unsigned char *W = (const unsigned char *)w;
+  __bf16 *C = (__bf16 *)c;
+  const hipStream_t st = (hipStream_t)stream;
+  if (M <= 16) {
+    dim3 grid((N + 127) / 128, (M + 15) / 16);
+    hipLaunchKernelGGL((radiance_w16_gemm<1, 8, 1, 1, 0, false, false>), grid, dim3(256), 0, st,
+                       A, W, W, C, (float *)nullptr, M, N, K);
+    return;
+  }
+  if (tile == 1) {
+    dim3 grid((N + 63) / 64, (M + 255) / 256);
+    hipLaunchKernelGGL((radiance_w16_gemm<4, 2, 4, 2, 0, false, false>), grid, dim3(256), 0, st,
+                       A, W, W, C, (float *)nullptr, M, N, K);
+  } else if (tile == 2) {
+    dim3 grid((N + 127) / 128, (M + 127) / 128);
+    hipLaunchKernelGGL((radiance_w16_gemm<4, 4, 2, 2, 0, false, false>), grid, dim3(512), 0, st,
+                       A, W, W, C, (float *)nullptr, M, N, K);
+  } else if (tile == 3) {
+    dim3 grid((N + 127) / 128, (M + 255) / 256);
+    hipLaunchKernelGGL((radiance_w16_gemm<4, 4, 4, 2, 0, false, false>), grid, dim3(512), 0, st,
+                       A, W, W, C, (float *)nullptr, M, N, K);
+  } else if (tile == 4) {
+    dim3 grid((N + 255) / 256, (M + 127) / 128);
+    hipLaunchKernelGGL((radiance_w16_gemm<2, 8, 4, 2, 0, false, false>), grid, dim3(512), 0, st,
+                       A, W, W, C, (float *)nullptr, M, N, K);
+  } else if (tile == 5) {
+    dim3 grid((N + 255) / 256, (M + 127) / 128);
+    hipLaunchKernelGGL((radiance_w16_gemm<4, 4, 2, 4, 0, false, false>), grid, dim3(512), 0, st,
+                       A, W, W, C, (float *)nullptr, M, N, K);
+  } else {
+    dim3 grid((N + 63) / 64, (M + 127) / 128);
+    hipLaunchKernelGGL((radiance_w16_gemm<4, 2, 2, 2, 0, false, false>), grid, dim3(256), 0, st,
+                       A, W, W, C, (float *)nullptr, M, N, K);
+  }
+}
+
 PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
   m.def("launch_at", &launch_at, "MXFP4 x FP8 WMMA GEMM on a fragment-tiled activation");
   m.def("launch", &launch, "MXFP4 x FP8 WMMA GEMM (gfx1201)");
@@ -2178,6 +2268,11 @@ PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
   m.def("launch_w8a16", &launch_w8a16,
         "FP8 weight-only GEMM: bf16 activations x dequantized e4m3 weights with 128x128 block "
         "scales");
+  m.def("launch_w16_bf16ref", &launch_w16_bf16ref,
+        "benchmark reference: the W4A16 WMMA body with already-bf16 [N,K] weights (no dequant); "
+        "tile 0=128x64, 1=256x64, 2=128x128, 3=256x128, 4=128x256(4x2), 5=128x256(2x4)");
+  m.def("set_w16_prefill_tile", &set_w16_prefill_tile,
+        "select the W4A16 prefill geometry for benchmarking (default = the shipped 320x128 tile)");
   m.def("launch_silu_mul_quant", &launch_silu_mul_quant,
         "fused silu(gate)*up + per-token e4m3 quant, one WG per row",
         py::arg("gu"), py::arg("q"), py::arg("scale"), py::arg("M"), py::arg("N"),

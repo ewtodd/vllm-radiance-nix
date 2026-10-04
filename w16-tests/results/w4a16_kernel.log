@@ -1,0 +1,112 @@
+w4a16 n=17408 k=5120 m=1 wperm=1 ptile=-1     124.6 us     1.4 TFLOP/s
+bf16 n=17408 k=5120 m=1                      317.3 us     0.6 TFLOP/s
+ref tile=2 n=17408 k=5120 m=1                562.5 us     0.3 TFLOP/s
+ref tile=3 n=17408 k=5120 m=1                563.9 us     0.3 TFLOP/s
+w4a16 n=17408 k=5120 m=8192 wperm=1 ptile=-1   17766.6 us    82.2 TFLOP/s
+bf16 n=17408 k=5120 m=8192                 14169.8 us   103.1 TFLOP/s
+ref tile=2 n=17408 k=5120 m=8192           24417.6 us    59.8 TFLOP/s
+ref tile=3 n=17408 k=5120 m=8192           20757.5 us    70.4 TFLOP/s
+w4a16 n=8192 k=5120 m=1 wperm=1 ptile=-1      65.0 us     1.3 TFLOP/s
+bf16 n=8192 k=5120 m=1                       139.7 us     0.6 TFLOP/s
+ref tile=2 n=8192 k=5120 m=1                 148.9 us     0.6 TFLOP/s
+ref tile=3 n=8192 k=5120 m=1                 145.9 us     0.6 TFLOP/s
+w4a16 n=8192 k=5120 m=8192 wperm=1 ptile=-1    8636.6 us    79.6 TFLOP/s
+bf16 n=8192 k=5120 m=8192                   6782.1 us   101.3 TFLOP/s
+ref tile=2 n=8192 k=5120 m=8192            11378.7 us    60.4 TFLOP/s
+ref tile=3 n=8192 k=5120 m=8192             9842.8 us    69.8 TFLOP/s
+w4a16 n=7168 k=5120 m=1 wperm=1 ptile=-1      63.8 us     1.1 TFLOP/s
+bf16 n=7168 k=5120 m=1                       104.6 us     0.7 TFLOP/s
+ref tile=2 n=7168 k=5120 m=1                 120.3 us     0.6 TFLOP/s
+ref tile=3 n=7168 k=5120 m=1                 118.8 us     0.6 TFLOP/s
+w4a16 n=7168 k=5120 m=8192 wperm=1 ptile=-1    7542.3 us    79.7 TFLOP/s
+bf16 n=7168 k=5120 m=8192                   5957.2 us   100.9 TFLOP/s
+ref tile=2 n=7168 k=5120 m=8192             9551.4 us    63.0 TFLOP/s
+ref tile=3 n=7168 k=5120 m=8192             8493.2 us    70.8 TFLOP/s
+w4a16 n=5120 k=8704 m=1 wperm=1 ptile=-1      67.1 us     1.3 TFLOP/s
+bf16 n=5120 k=8704 m=1                       144.1 us     0.6 TFLOP/s
+ref tile=2 n=5120 k=8704 m=1                 219.6 us     0.4 TFLOP/s
+ref tile=3 n=5120 k=8704 m=1                 198.4 us     0.4 TFLOP/s
+w4a16 n=5120 k=8704 m=8192 wperm=1 ptile=-1    9142.5 us    79.9 TFLOP/s
+bf16 n=5120 k=8704 m=8192                   6367.5 us   114.7 TFLOP/s
+ref tile=2 n=5120 k=8704 m=8192            11792.4 us    61.9 TFLOP/s
+ref tile=3 n=5120 k=8704 m=8192            10495.7 us    69.6 TFLOP/s
+w4a16 n=5120 k=3072 m=1 wperm=1 ptile=-1      28.3 us     1.1 TFLOP/s
+bf16 n=5120 k=3072 m=1                        25.0 us     1.3 TFLOP/s
+ref tile=2 n=5120 k=3072 m=1                  61.8 us     0.5 TFLOP/s
+ref tile=3 n=5120 k=3072 m=1                  60.3 us     0.5 TFLOP/s
+w4a16 n=5120 k=3072 m=8192 wperm=1 ptile=-1    3312.9 us    77.8 TFLOP/s
+bf16 n=5120 k=3072 m=8192                   2466.1 us   104.5 TFLOP/s
+ref tile=2 n=5120 k=3072 m=8192             3781.8 us    68.1 TFLOP/s
+ref tile=3 n=5120 k=3072 m=8192             3395.4 us    75.9 TFLOP/s
+w4a16 n=48 k=5120 m=1 wperm=1 ptile=-1        23.4 us     0.0 TFLOP/s
+bf16 n=48 k=5120 m=1                          14.0 us     0.0 TFLOP/s
+ref tile=2 n=48 k=5120 m=1                    73.5 us     0.0 TFLOP/s
+ref tile=3 n=48 k=5120 m=1                    69.5 us     0.0 TFLOP/s
+w4a16 n=48 k=5120 m=8192 wperm=1 ptile=-1     259.2 us    15.5 TFLOP/s
+bf16 n=48 k=5120 m=8192                      130.3 us    30.9 TFLOP/s
+ref tile=2 n=48 k=5120 m=8192                207.0 us    19.4 TFLOP/s
+ref tile=3 n=48 k=5120 m=8192                358.6 us    11.2 TFLOP/s
+
+whole-forward weighted totals (us):
+  w4a16 n=17408 k=5120 m=1 wperm=1 ptile=-1       7975.4
+  w4a16 n=17408 k=5120 m=8192 wperm=1 ptile=-1    1137064.3
+  w4a16 n=48 k=5120 m=1 wperm=1 ptile=-1         1123.9
+  w4a16 n=48 k=5120 m=8192 wperm=1 ptile=-1      12442.8
+  w4a16 n=5120 k=3072 m=1 wperm=1 ptile=-1       1809.7
+  w4a16 n=5120 k=3072 m=8192 wperm=1 ptile=-1     212024.4
+  w4a16 n=5120 k=8704 m=1 wperm=1 ptile=-1       4293.6
+  w4a16 n=5120 k=8704 m=8192 wperm=1 ptile=-1     585117.0
+  w4a16 n=7168 k=5120 m=1 wperm=1 ptile=-1       1021.4
+  w4a16 n=7168 k=5120 m=8192 wperm=1 ptile=-1     120677.0
+  w4a16 n=8192 k=5120 m=1 wperm=1 ptile=-1       3122.0
+  w4a16 n=8192 k=5120 m=8192 wperm=1 ptile=-1     414557.5
+{
+ "w4a16 n=17408 k=5120 m=1 wperm=1 ptile=-1": 124.61523214975993,
+ "bf16 n=17408 k=5120 m=1": 317.29138692220056,
+ "ref tile=2 n=17408 k=5120 m=1": 562.4897003173828,
+ "ref tile=3 n=17408 k=5120 m=1": 563.8924280802408,
+ "w4a16 n=17408 k=5120 m=8192 wperm=1 ptile=-1": 17766.630045572918,
+ "bf16 n=17408 k=5120 m=8192": 14169.789632161459,
+ "ref tile=2 n=17408 k=5120 m=8192": 24417.582194010418,
+ "ref tile=3 n=17408 k=5120 m=8192": 20757.47273763021,
+ "w4a16 n=8192 k=5120 m=1 wperm=1 ptile=-1": 65.04100163777669,
+ "bf16 n=8192 k=5120 m=1": 139.74876403808594,
+ "ref tile=2 n=8192 k=5120 m=1": 148.8662401835124,
+ "ref tile=3 n=8192 k=5120 m=1": 145.88082631429037,
+ "w4a16 n=8192 k=5120 m=8192 wperm=1 ptile=-1": 8636.61397298177,
+ "bf16 n=8192 k=5120 m=8192": 6782.1278889973955,
+ "ref tile=2 n=8192 k=5120 m=8192": 11378.67431640625,
+ "ref tile=3 n=8192 k=5120 m=8192": 9842.75410970052,
+ "w4a16 n=7168 k=5120 m=1 wperm=1 ptile=-1": 63.83693218231201,
+ "bf16 n=7168 k=5120 m=1": 104.57890033721924,
+ "ref tile=2 n=7168 k=5120 m=1": 120.32313346862793,
+ "ref tile=3 n=7168 k=5120 m=1": 118.75642935434976,
+ "w4a16 n=7168 k=5120 m=8192 wperm=1 ptile=-1": 7542.313130696614,
+ "bf16 n=7168 k=5120 m=8192": 5957.152811686198,
+ "ref tile=2 n=7168 k=5120 m=8192": 9551.439412434895,
+ "ref tile=3 n=7168 k=5120 m=8192": 8493.167622884113,
+ "w4a16 n=5120 k=8704 m=1 wperm=1 ptile=-1": 67.08769798278809,
+ "bf16 n=5120 k=8704 m=1": 144.05682881673175,
+ "ref tile=2 n=5120 k=8704 m=1": 219.5953051249186,
+ "ref tile=3 n=5120 k=8704 m=1": 198.41496149698892,
+ "w4a16 n=5120 k=8704 m=8192 wperm=1 ptile=-1": 9142.453002929688,
+ "bf16 n=5120 k=8704 m=8192": 6367.491658528646,
+ "ref tile=2 n=5120 k=8704 m=8192": 11792.363484700521,
+ "ref tile=3 n=5120 k=8704 m=8192": 10495.748901367188,
+ "w4a16 n=5120 k=3072 m=1 wperm=1 ptile=-1": 28.27643354733785,
+ "bf16 n=5120 k=3072 m=1": 24.95636741320292,
+ "ref tile=2 n=5120 k=3072 m=1": 61.7742657661438,
+ "ref tile=3 n=5120 k=3072 m=1": 60.26223500569662,
+ "w4a16 n=5120 k=3072 m=8192 wperm=1 ptile=-1": 3312.8807067871094,
+ "bf16 n=5120 k=3072 m=8192": 2466.107940673828,
+ "ref tile=2 n=5120 k=3072 m=8192": 3781.7530314127607,
+ "ref tile=3 n=5120 k=3072 m=8192": 3395.3595479329424,
+ "w4a16 n=48 k=5120 m=1 wperm=1 ptile=-1": 23.413699865341187,
+ "bf16 n=48 k=5120 m=1": 13.965566953023275,
+ "ref tile=2 n=48 k=5120 m=1": 73.465100924174,
+ "ref tile=3 n=48 k=5120 m=1": 69.47036584218343,
+ "w4a16 n=48 k=5120 m=8192 wperm=1 ptile=-1": 259.2252731323242,
+ "bf16 n=48 k=5120 m=8192": 130.2673021952311,
+ "ref tile=2 n=48 k=5120 m=8192": 207.02179272969565,
+ "ref tile=3 n=48 k=5120 m=8192": 358.5787773132324
+}
