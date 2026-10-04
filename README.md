@@ -49,9 +49,9 @@ in
 Standalone:
 
 ```bash
-nix build          # the vLLM python environment (packages.default)
-nix develop        # shell with it on PATH
-nix run .#vllm -- --help
+nix build                                # the vLLM python environment (packages.default)
+nix develop                              # shell with vllm + the radiance kernels on PATH
+nix shell .#pythonEnv -c vllm -- --help  # or: vllm serve <model> ...
 ```
 
 `mkVllmStack` returns `pythonEnv`, `vllm`, `aiter`, `torch`, `libr4d`, `rocmSdk`, `rocmSdkCc`,
