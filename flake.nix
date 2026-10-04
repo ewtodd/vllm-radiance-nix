@@ -1,5 +1,5 @@
 {
-  description = "vLLM Radiance: a Nix build of vLLM for AMD RDNA4 (gfx1201 / Radeon AI PRO R9700)";
+  description = "vllm-radiance-nix: a Nix build of vLLM for AMD RDNA4 (gfx1201 / Radeon AI PRO R9700)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   inputs.libr4d = {

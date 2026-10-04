@@ -1,9 +1,11 @@
-# vllm-radiance (MXFP4)
+# vllm-radiance-nix
 
-A vLLM inference server for the **AMD Radeon AI PRO R9700 (gfx1201 / RDNA4)**, packaged as a
-container image. It bundles a working ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4
-patches and custom kernels needed to run vLLM on this card, plus RDNA4-tuned GEMM / attention /
-all-reduce paths and a speculative draft controller.
+A Nix flake that builds vLLM for the **AMD Radeon AI PRO R9700 (gfx1201 / RDNA4)** from source.
+Forked from [`ggz14/radiance-vllm-mxfp4`](https://codeberg.org/ggz14/radiance-vllm-mxfp4), adding
+native **W4A16 / W8A16** weight-only GEMMs, the DFlash2 draft-rope patch, and the self-contained Nix
+build (see [Nix (flake)](#nix-flake)). It serves the same checkpoints as upstream: MXFP4, FP8, and
+ParoQuant (int4 W4A8, int5 W5A8, MXFP6 W6A8). The container-image workflow from upstream is kept
+below.
 
 One command after the clone gets you a server. You do not build an image, and you do not edit
 anything for a different card count.
