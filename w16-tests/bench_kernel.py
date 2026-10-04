@@ -75,6 +75,9 @@ def main():
     parser.add_argument("--tiles", default="0,1,2")
     parser.add_argument("--ptiles", default="-1",
                         help="W4A16 prefill tile configs to sweep via set_w16_prefill_tile")
+    parser.add_argument("--raws", default="0",
+                        help="W4A16 staging variants: 0 = real dequant, 1 = fp4 loads/stores "
+                             "without the dequant arithmetic (set_w16_raw)")
     parser.add_argument("--reps", type=int, default=30)
     parser.add_argument("--total", action="store_true",
                         help="weight the per-shape us by COUNTS into a whole-forward estimate")
@@ -107,16 +110,20 @@ def main():
                 for ptile in [int(t) for t in args.ptiles.split(",")]:
                     if hasattr(ext, "set_w16_prefill_tile"):
                         ext.set_w16_prefill_tile(ptile)
-                    y = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
-                    us = time_call(lambda: ext.launch_w4a16(
-                        av.data_ptr(), w.data_ptr(), scale.data_ptr(), y.data_ptr(),
-                        scratch.data_ptr(), m, n, k, wperm,
-                        torch.cuda.current_stream().cuda_stream), reps=args.reps)
-                    key = "w4a16 n=%d k=%d m=%d wperm=%d ptile=%d" % (n, k, m, wperm, ptile)
-                    out[key] = us
-                    print("%-40s %9.1f us  %6.1f TFLOP/s" % (key, us, tflops(m, n, k, us)))
-                    if args.total:
-                        totals[key] = totals.get(key, 0.0) + us * COUNTS.get((n, k), 0)
+                    for raw in [int(r) for r in args.raws.split(",")]:
+                        if hasattr(ext, "set_w16_raw"):
+                            ext.set_w16_raw(raw)
+                        y = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+                        us = time_call(lambda: ext.launch_w4a16(
+                            av.data_ptr(), w.data_ptr(), scale.data_ptr(), y.data_ptr(),
+                            scratch.data_ptr(), m, n, k, wperm,
+                            torch.cuda.current_stream().cuda_stream), reps=args.reps)
+                        key = "w4a16 n=%d k=%d m=%d wperm=%d ptile=%d raw=%d" % (
+                            n, k, m, wperm, ptile, raw)
+                        out[key] = us
+                        print("%-40s %9.1f us  %6.1f TFLOP/s" % (key, us, tflops(m, n, k, us)))
+                        if args.total:
+                            totals[key] = totals.get(key, 0.0) + us * COUNTS.get((n, k), 0)
             if "w8a16" in arms:
                 y = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
                 us = time_call(lambda: ext.launch_w8a16(

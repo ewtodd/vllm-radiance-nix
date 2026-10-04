@@ -1,0 +1,9 @@
+# wmma_peak.hip, gfx1201, back-to-back wmma_f32_16x16x16_bf16_w32_gfx12, no memory traffic
+# invocation: HIP_VISIBLE_DEVICES=<d> /tmp/wmma_peak <blocks> <iters> <threads>
+
+blocks=128 iters=50000 threads=256 reps=20  17.725 ms/rep  189.3 TFLOP/s
+blocks=256 iters=50000 threads=256 reps=20  35.546 ms/rep  188.8 TFLOP/s
+blocks=512 iters=50000 threads=256 reps=20  71.422 ms/rep  187.9 TFLOP/s
+blocks=128 iters=50000 threads=256 reps=20  18.779 ms/rep  178.7 TFLOP/s
+blocks=256 iters=50000 threads=256 reps=20  36.203 ms/rep  185.4 TFLOP/s
+blocks=512 iters=50000 threads=256 reps=20  71.813 ms/rep  186.9 TFLOP/s

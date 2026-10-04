@@ -1,0 +1,40 @@
+w4a16 n=17408 k=5120 m=8192 wperm=1 ptile=-1 raw=0   17525.7 us    83.3 TFLOP/s
+w4a16 n=17408 k=5120 m=8192 wperm=1 ptile=-1 raw=1   16904.4 us    86.4 TFLOP/s
+w4a16 n=8192 k=5120 m=8192 wperm=1 ptile=-1 raw=0    8533.2 us    80.5 TFLOP/s
+w4a16 n=8192 k=5120 m=8192 wperm=1 ptile=-1 raw=1    8163.2 us    84.2 TFLOP/s
+w4a16 n=7168 k=5120 m=8192 wperm=1 ptile=-1 raw=0    7424.8 us    81.0 TFLOP/s
+w4a16 n=7168 k=5120 m=8192 wperm=1 ptile=-1 raw=1    7041.3 us    85.4 TFLOP/s
+w4a16 n=5120 k=8704 m=8192 wperm=1 ptile=-1 raw=0    9007.8 us    81.1 TFLOP/s
+w4a16 n=5120 k=8704 m=8192 wperm=1 ptile=-1 raw=1    8564.0 us    85.3 TFLOP/s
+w4a16 n=5120 k=3072 m=8192 wperm=1 ptile=-1 raw=0    3279.5 us    78.6 TFLOP/s
+w4a16 n=5120 k=3072 m=8192 wperm=1 ptile=-1 raw=1    3143.4 us    82.0 TFLOP/s
+w4a16 n=48 k=5120 m=8192 wperm=1 ptile=-1 raw=0     280.2 us    14.4 TFLOP/s
+w4a16 n=48 k=5120 m=8192 wperm=1 ptile=-1 raw=1     249.7 us    16.1 TFLOP/s
+
+whole-forward weighted totals (us):
+  w4a16 n=17408 k=5120 m=8192 wperm=1 ptile=-1 raw=0    1121646.6
+  w4a16 n=17408 k=5120 m=8192 wperm=1 ptile=-1 raw=1    1081882.7
+  w4a16 n=48 k=5120 m=8192 wperm=1 ptile=-1 raw=0      13450.7
+  w4a16 n=48 k=5120 m=8192 wperm=1 ptile=-1 raw=1      11986.2
+  w4a16 n=5120 k=3072 m=8192 wperm=1 ptile=-1 raw=0     209887.0
+  w4a16 n=5120 k=3072 m=8192 wperm=1 ptile=-1 raw=1     201175.3
+  w4a16 n=5120 k=8704 m=8192 wperm=1 ptile=-1 raw=0     576498.9
+  w4a16 n=5120 k=8704 m=8192 wperm=1 ptile=-1 raw=1     548093.0
+  w4a16 n=7168 k=5120 m=8192 wperm=1 ptile=-1 raw=0     118796.4
+  w4a16 n=7168 k=5120 m=8192 wperm=1 ptile=-1 raw=1     112661.2
+  w4a16 n=8192 k=5120 m=8192 wperm=1 ptile=-1 raw=0     409594.0
+  w4a16 n=8192 k=5120 m=8192 wperm=1 ptile=-1 raw=1     391833.3
+{
+ "w4a16 n=17408 k=5120 m=8192 wperm=1 ptile=-1 raw=0": 17525.728352864582,
+ "w4a16 n=17408 k=5120 m=8192 wperm=1 ptile=-1 raw=1": 16904.416910807293,
+ "w4a16 n=8192 k=5120 m=8192 wperm=1 ptile=-1 raw=0": 8533.208719889324,
+ "w4a16 n=8192 k=5120 m=8192 wperm=1 ptile=-1 raw=1": 8163.194274902344,
+ "w4a16 n=7168 k=5120 m=8192 wperm=1 ptile=-1 raw=0": 7424.774678548177,
+ "w4a16 n=7168 k=5120 m=8192 wperm=1 ptile=-1 raw=1": 7041.3279215494795,
+ "w4a16 n=5120 k=8704 m=8192 wperm=1 ptile=-1 raw=0": 9007.79520670573,
+ "w4a16 n=5120 k=8704 m=8192 wperm=1 ptile=-1 raw=1": 8563.95263671875,
+ "w4a16 n=5120 k=3072 m=8192 wperm=1 ptile=-1 raw=0": 3279.4843037923174,
+ "w4a16 n=5120 k=3072 m=8192 wperm=1 ptile=-1 raw=1": 3143.3642069498696,
+ "w4a16 n=48 k=5120 m=8192 wperm=1 ptile=-1 raw=0": 280.2228609720866,
+ "w4a16 n=48 k=5120 m=8192 wperm=1 ptile=-1 raw=1": 249.71323013305664
+}

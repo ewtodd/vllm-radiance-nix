@@ -1886,7 +1886,7 @@ __device__ __forceinline__ v8f wmma_bf16(v8bf a, v8bf b, v8f c) {
 // WT: 0 = MXFP4 (packed nibbles, e8m0 scale per 32 K), 1 = e4m3 (f32 scale per 128x128 block).
 // Stages one BW_BK slab of A and dequantized W into LDS. Pulled out of the WMMA kernel so the
 // double-buffered pipeline can stage the next slab while the WMMA loop runs on the current one.
-template <int TWM, int TWN, int TTM, int TTN, int WT, bool WPERM, bool DQ>
+template <int TWM, int TWN, int TTM, int TTN, int WT, bool WPERM, bool DQ, bool RAW = false>
 __device__ __forceinline__ void w16_stage(
     unsigned short *sA, unsigned short *sW, const __bf16 *__restrict__ A,
     const unsigned char *__restrict__ W, const unsigned char *__restrict__ Ws,
@@ -1975,11 +1975,21 @@ __device__ __forceinline__ void w16_stage(
           const float s = e8m0_to_f((wsw >> (8 * q)) & 0xFFu);
           // bytes 0,1 -> k = kst*16 + 4*half; bytes 2,3 -> +8
           unsigned int e0w[4];
+          if constexpr (RAW) {
+            // Benchmark-only: same fp4 loads and same sW stores as the dequant path, but the
+            // E2M1 table lookup, E8M0 decode and f32 multiply are removed. Isolates the cost of
+            // the dequant arithmetic from the staging data path.
+            e0w[0] = wq[q] ^ (unsigned int)(wsw & 1u);
+            e0w[1] = wq[q];
+            e0w[2] = wq[q];
+            e0w[3] = wq[q];
+          } else {
 #pragma unroll
-          for (int t = 0; t < 4; ++t) {
-            const unsigned char byte = (unsigned char)(wq[q] >> (8 * t));
-            e0w[t] = f2bf2_pack(bf16h_to_f(kE2M1H[byte & 15]) * s,
-                                bf16h_to_f(kE2M1H[byte >> 4]) * s);
+            for (int t = 0; t < 4; ++t) {
+              const unsigned char byte = (unsigned char)(wq[q] >> (8 * t));
+              e0w[t] = f2bf2_pack(bf16h_to_f(kE2M1H[byte & 15]) * s,
+                                  bf16h_to_f(kE2M1H[byte >> 4]) * s);
+            }
           }
           const uint2_t dw = uint2_t{e0w[0], e0w[1]};
           const uint2_t up = uint2_t{e0w[2], e0w[3]};
@@ -2017,7 +2027,7 @@ __device__ __forceinline__ void w16_stage(
 
 // DQ=false is the benchmark-only roofline reference: W is an already-dequantized [N,K] bf16 matrix
 // staged straight into sW, so the identical WMMA loop runs with the dequantization removed.
-template <int TWM, int TWN, int TTM, int TTN, int WT, bool WPERM, bool DQ = true>
+template <int TWM, int TWN, int TTM, int TTN, int WT, bool WPERM, bool DQ = true, bool RAW = false>
 __global__ __launch_bounds__((TWM * TWN) * 32) void radiance_w16_gemm(
     const __bf16 *__restrict__ A, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, __bf16 *__restrict__ C,
@@ -2047,7 +2057,8 @@ __global__ __launch_bounds__((TWM * TWN) * 32) void radiance_w16_gemm(
   const int kc = K / ks;
   const int kb = blockIdx.z * kc;
   for (int k0 = kb; k0 < kb + kc; k0 += BW_BK) {
-    w16_stage<TWM, TWN, TTM, TTN, WT, WPERM, DQ>(sA, sW, A, W, Ws, m0, n0, k0, M, N, K, tid);
+    w16_stage<TWM, TWN, TTM, TTN, WT, WPERM, DQ, RAW>(sA, sW, A, W, Ws, m0, n0, k0, M, N, K,
+                                                     tid);
     radiance_lds_barrier();
 
 #pragma unroll
@@ -2127,8 +2138,11 @@ static int w16_ksplit(int nblk, int M, int K) {
 // tile and 3 selects 256x128; anything else uses the default.
 static int g_w16_prefill_tile = -1;
 static void set_w16_prefill_tile(int tile) { g_w16_prefill_tile = tile; }
+// Benchmark-only: stage the fp4 weights with the dequant arithmetic removed (see w16_stage).
+static int g_w16_raw = 0;
+static void set_w16_raw(int raw) { g_w16_raw = raw; }
 
-template <int TWM, int TWN, int TTM, int TTN>
+template <int TWM, int TWN, int TTM, int TTN, bool RAW = false>
 static void w16_prefill(const __bf16 *A, const unsigned char *W, const unsigned char *Ws,
                         __bf16 *C, float *P, int M, int N, int K, bool wperm, hipStream_t st) {
   constexpr int NTH = TWM * TWN * 32;
@@ -2136,11 +2150,11 @@ static void w16_prefill(const __bf16 *A, const unsigned char *W, const unsigned 
   constexpr int BW_BN = TWN * TTN * 16;
   dim3 grid((N + BW_BN - 1) / BW_BN, (M + BW_BM - 1) / BW_BM);
   if (wperm)
-    hipLaunchKernelGGL((radiance_w16_gemm<TWM, TWN, TTM, TTN, 0, true>), grid, dim3(NTH), 0, st,
-                       A, W, Ws, C, P, M, N, K);
+    hipLaunchKernelGGL((radiance_w16_gemm<TWM, TWN, TTM, TTN, 0, true, true, RAW>), grid,
+                       dim3(NTH), 0, st, A, W, Ws, C, P, M, N, K);
   else
-    hipLaunchKernelGGL((radiance_w16_gemm<TWM, TWN, TTM, TTN, 0, false>), grid, dim3(NTH), 0, st,
-                       A, W, Ws, C, P, M, N, K);
+    hipLaunchKernelGGL((radiance_w16_gemm<TWM, TWN, TTM, TTN, 0, false, true, RAW>), grid,
+                       dim3(NTH), 0, st, A, W, Ws, C, P, M, N, K);
 }
 
 static void launch_w4a16(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t c, uintptr_t p,
@@ -2174,6 +2188,8 @@ static void launch_w4a16(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t c, ui
     w16_prefill<4, 2, 2, 2>(A, W, Ws, C, P, M, N, K, wperm, st);   // old 128x64, 8 waves, 2x2
   } else if (g_w16_prefill_tile == 3) {
     w16_prefill<4, 4, 4, 2>(A, W, Ws, C, P, M, N, K, wperm, st);   // 256x128, 16 waves, 4x2
+  } else if (g_w16_raw) {
+    w16_prefill<4, 4, 5, 2, true>(A, W, Ws, C, P, M, N, K, wperm, st);   // same tile, no dequant ALU
   } else {
     // The shipped W4A16 prefill tile: 320 M x 128 N (4x4 waves of 5x2 fragments). It amortizes the
     // per-slab barrier and the sA/sW staging over 50 WMMA per wave and measured 1.31x the old
@@ -2215,7 +2231,8 @@ static void launch_w8a16(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t c, ui
 // Benchmark-only reference: the production WMMA body with the weight dequantization removed (W is
 // already bf16 [N,K]). `tile` picks the prefill geometry so the roofline can be measured per tile:
 //   0 = 128x64 (4x2 waves, 2x2 frags), 1 = 256x64 (4x2, 4x2), 2 = 128x128 (4x4, 2x2),
-//   3 = 256x128 (4x4, 4x2), 4 = 128x256 (2x8, 4x2), 5 = 128x256 (4x4, 2x4).
+//   3 = 256x128 (4x4, 4x2), 4 = 128x256 (2x8, 4x2), 5 = 128x256 (4x4, 2x4),
+//   6 = 320x128 (4x4, 5x2 -- the shipped W4A16 tile).
 static void launch_w16_bf16ref(uintptr_t a, uintptr_t w, uintptr_t c, int M, int N, int K, int tile,
                                uintptr_t stream) {
   const __bf16 *A = (const __bf16 *)a;
@@ -2248,6 +2265,10 @@ static void launch_w16_bf16ref(uintptr_t a, uintptr_t w, uintptr_t c, int M, int
     dim3 grid((N + 255) / 256, (M + 127) / 128);
     hipLaunchKernelGGL((radiance_w16_gemm<4, 4, 2, 4, 0, false, false>), grid, dim3(512), 0, st,
                        A, W, W, C, (float *)nullptr, M, N, K);
+  } else if (tile == 6) {
+    dim3 grid((N + 127) / 128, (M + 319) / 320);
+    hipLaunchKernelGGL((radiance_w16_gemm<4, 4, 5, 2, 0, false, false>), grid, dim3(512), 0, st,
+                       A, W, W, C, (float *)nullptr, M, N, K);
   } else {
     dim3 grid((N + 63) / 64, (M + 127) / 128);
     hipLaunchKernelGGL((radiance_w16_gemm<4, 2, 2, 2, 0, false, false>), grid, dim3(256), 0, st,
@@ -2270,9 +2291,12 @@ PYBIND11_MODULE(radiance_mxfp4_fp8, m) {
         "scales");
   m.def("launch_w16_bf16ref", &launch_w16_bf16ref,
         "benchmark reference: the W4A16 WMMA body with already-bf16 [N,K] weights (no dequant); "
-        "tile 0=128x64, 1=256x64, 2=128x128, 3=256x128, 4=128x256(4x2), 5=128x256(2x4)");
+        "tile 0=128x64, 1=256x64, 2=128x128, 3=256x128, 4=128x256(4x2), 5=128x256(2x4), "
+        "6=320x128");
   m.def("set_w16_prefill_tile", &set_w16_prefill_tile,
         "select the W4A16 prefill geometry for benchmarking (default = the shipped 320x128 tile)");
+  m.def("set_w16_raw", &set_w16_raw,
+        "benchmark-only: stage fp4 weights without the dequant arithmetic, to isolate its cost");
   m.def("launch_silu_mul_quant", &launch_silu_mul_quant,
         "fused silu(gate)*up + per-token e4m3 quant, one WG per row",
         py::arg("gu"), py::arg("q"), py::arg("scale"), py::arg("M"), py::arg("N"),
