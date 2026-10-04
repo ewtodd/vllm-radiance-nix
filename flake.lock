@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "libr4d": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787588695,
+        "narHash": "sha256-FzyGGx+cctCg0O2kGuBVuVhZ4hpJbylyCLKRg/xTaZA=",
+        "ref": "refs/heads/main",
+        "rev": "b9e42ab7202f53a3bc13d415f5d41481f9ca311b",
+        "revCount": 4,
+        "type": "git",
+        "url": "https://codeberg.org/StillDeadcode/libr4d"
+      },
+      "original": {
+        "rev": "b9e42ab7202f53a3bc13d415f5d41481f9ca311b",
+        "type": "git",
+        "url": "https://codeberg.org/StillDeadcode/libr4d"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1791048980,
+        "narHash": "sha256-KgItSKML8Xvte0B7/uGnBDsYzSnnKHcOaiUbgWBXLXw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "a7868a727837f3c09cee2ce0ca671c76b1589fed",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "libr4d": "libr4d",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

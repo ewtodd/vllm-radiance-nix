@@ -23,6 +23,45 @@ Or drive the two scripts it wraps, on podman or docker:
 Either way you end up at `http://localhost:8080/v1`. [Quick start](#quick-start) walks the whole
 path, with what each step costs and what to do when one of them stops.
 
+## Nix (flake)
+
+The build recipe lives in this repo, so a NixOS host can consume it directly -- no container, and
+no vLLM packaging in the host configuration. `mkVllmStack` takes the host's `pkgs` so there is only
+one nixpkgs in the build; `libr4d` is this flake's own input, pinned here:
+
+```nix
+# flake.nix
+inputs.vllm-radiance.url = "git+https://codeberg.org/ewtodd/radiance-vllm-mxfp4";
+
+# a NixOS module
+{ pkgs, inputs, ... }:
+let
+  stack = inputs.vllm-radiance.lib.${pkgs.stdenv.hostPlatform.system}.mkVllmStack {
+    inherit pkgs;
+  };
+in
+{
+  # stack.pythonEnv has vllm + the radiance kernels + libr4d on PATH
+  environment.systemPackages = [ stack.pythonEnv ];
+}
+```
+
+Standalone:
+
+```bash
+nix build          # the vLLM python environment (packages.default)
+nix develop        # shell with it on PATH
+nix run .#vllm -- --help
+```
+
+`mkVllmStack` returns `pythonEnv`, `vllm`, `aiter`, `torch`, `libr4d`, `rocmSdk`, `rocmSdkCc`,
+`runtimeLibs` and `gfxArch`. Everything is built from source: the TheRock ROCm SDK for gfx120X,
+PyTorch (ROCm), Triton, AITER 0.1.17, vLLM 0.29.0 on transformers 5.14.1, the pinned
+[`libr4d`](https://codeberg.org/StillDeadcode/libr4d), the HIP kernels in this repo
+(`radiance_mxfp4_fp8.hip`, `paroquant/radiance_paroquant.hip`) and the in-repo patch chain --
+including the native **W4A16 / W8A16** weight-only GEMMs and the DFlash2 draft-rope patch. Tested on
+2 x Radeon AI PRO R9700 (gfx1201), TP=2.
+
 ## Contents
 
 - [Status](#status)
