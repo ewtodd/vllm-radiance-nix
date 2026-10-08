@@ -1,0 +1,28 @@
+diff -ruN a/cmake/Dependencies.cmake b/cmake/Dependencies.cmake
+--- a/cmake/Dependencies.cmake	2026-10-08 11:21:06.824077626 -0500
++++ b/cmake/Dependencies.cmake	2026-10-08 11:23:09.284176590 -0500
+@@ -1112,13 +1112,6 @@
+       endif()
+     endif()
+ 
+-    # ROCM-SMI needed to support symmetric memory
+-    if(USE_DISTRIBUTED AND UNIX)
+-      list(APPEND Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS
+-        rocm_smi64
+-      )
+-    endif()
+-
+     # ---[ Kernel asserts
+     # Kernel asserts is disabled for ROCm by default.
+     # It can be turned on by turning on the env USE_ROCM_KERNEL_ASSERT to the build system.
+diff -ruN a/cmake/public/LoadHIP.cmake b/cmake/public/LoadHIP.cmake
+--- a/cmake/public/LoadHIP.cmake	2026-10-08 11:21:06.824880270 -0500
++++ b/cmake/public/LoadHIP.cmake	2026-10-08 11:23:09.284279905 -0500
+@@ -328,7 +328,6 @@
+   if(UNIX)
+     find_package_and_print_version(rccl)
+     find_package_and_print_version(hsa-runtime64 REQUIRED)
+-    find_package_and_print_version(rocm_smi REQUIRED)
+   endif()
+ 
+   # Optional components.

@@ -241,6 +241,9 @@ let
           stdenv = pkgs.gcc15Stdenv;
         }).overrideAttrs
           (old: {
+            # TheRock 10.1 dropped rocm_smi; torch only used it for ROCm
+            # symmetric memory, so drop the find_package and the link.
+            patches = old.patches ++ [ ../torch-drop-rocm-smi.patch ];
             buildInputs = old.buildInputs ++ [ pkgs.libdrm ];
             env =
               old.env
