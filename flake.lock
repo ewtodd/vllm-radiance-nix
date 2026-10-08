@@ -33,10 +33,45 @@
         "type": "github"
       }
     },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1791456040,
+        "narHash": "sha256-H83yz/do+hjOO0uujHyH8RgtIQP2v7Mw+cLwcZK/xKc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e7439b6b14ad3cc35d05608ebca9bce01a25f5f8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "libr4d": "libr4d",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "therock-sdk": "therock-sdk"
+      }
+    },
+    "therock-sdk": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_2"
+      },
+      "locked": {
+        "lastModified": 1791475071,
+        "narHash": "sha256-bJlR/zOcncvylCrzcX3krFa3T1Cby4kmA7d7nNVx/Wk=",
+        "owner": "ewtodd",
+        "repo": "therock-sdk-nix",
+        "rev": "b11e0906c272f12f15c51933daa33c1627401001",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ewtodd",
+        "repo": "therock-sdk-nix",
+        "type": "github"
       }
     }
   },

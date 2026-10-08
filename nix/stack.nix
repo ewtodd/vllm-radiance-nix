@@ -2,13 +2,19 @@
   pkgs,
   r4dSrc,
   radianceSrc,
+  therockSdk,
 }:
 let
   inherit (pkgs) lib;
   gfxArch = "gfx1201";
 
-  rocmSdk = pkgs.callPackage ./rocm-sdk-therock.nix { family = "gfx120X-all"; };
-  rocmSdkCc = pkgs.callPackage ./rocm-sdk-cc.nix { inherit rocmSdk; };
+  rocmSdk = therockSdk.lib.${pkgs.stdenv.hostPlatform.system}.mkRocmSdk {
+    inherit pkgs;
+    family = "gfx120X-all";
+  };
+  rocmSdkCc = therockSdk.lib.${pkgs.stdenv.hostPlatform.system}.mkRocmSdkCc {
+    inherit pkgs rocmSdk;
+  };
 
   rocmPackages = {
     clr = rocmSdk // {
