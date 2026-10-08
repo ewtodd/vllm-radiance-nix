@@ -331,15 +331,34 @@ let
 
       amdsmi = self.buildPythonPackage {
         pname = "amdsmi";
-        version = "27.0.0+6b0e43f3";
+        # Must match share/amd_smi/amdsmi/_version.py in the TheRock tarball.
+        version = "27.1.0+7da43026";
         pyproject = true;
         src = "${rocmSdk}/share/amd_smi";
         build-system = [ self.setuptools ];
         postPatch = ''
-          rm -f amdsmi/libamd_smi.so
+          # TheRock 10.1.0 dropped pyproject.toml/setup.py from share/amd_smi;
+          # restore the same minimal setuptools metadata the wheel was built with.
+          cat > pyproject.toml <<'EOF'
+          [build-system]
+          requires = ["setuptools>=59.0"]
+          build-backend = "setuptools.build_meta"
+
+          [project]
+          name = "amdsmi"
+          version = "27.1.0+7da43026"
+          description = "AMDSMI Python LIB - AMD GPU Monitoring Library"
+          requires-python = ">=3.6"
+
+          [tool.setuptools]
+          packages = ["amdsmi"]
+          EOF
+
+          # 10.1's wrapper resolves <root>/lib/<soname> relative to its own
+          # install tree; in site-packages the ROCm root is the SDK instead.
           substituteInPlace amdsmi/amdsmi_wrapper.py --replace-fail \
-            'possible_locations.append("libamd_smi.so")' \
-            'possible_locations.append("${rocmSdk}/lib/libamd_smi.so")'
+            'relocatable = here.parents[3] / "lib" / _AMDSMI_LIB_SONAME' \
+            'relocatable = Path("${rocmSdk}/lib") / _AMDSMI_LIB_SONAME'
         '';
         pythonImportsCheck = [ "amdsmi" ];
       };
