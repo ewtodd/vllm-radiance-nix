@@ -1,3 +1,5 @@
+**ARCHIVED — October 2026.** This project is archived in favor of [`StillDeadcode/radiance`](https://codeberg.org/StillDeadcode/radiance) packaged with [`radiance-nix`](https://github.com/ewtodd/radiance-nix).
+
 > **Attribution.** This repository is a fork of
 > [`ggz14/radiance-vllm-mxfp4`](https://codeberg.org/ggz14/radiance-vllm-mxfp4), which itself builds on
 > [`StillDeadcode/vllm-radiance`](https://codeberg.org/StillDeadcode/vllm-radiance). **The vast
